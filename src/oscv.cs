@@ -16,7 +16,7 @@ namespace Oscv
     static class App
     {
         // 版番号はここが唯一の出どころ (build.ps1 が読む)。v1 から 1 ずつ上げる。
-        public const int Version = 3;
+        public const int Version = 4;
     }
 
     // ================= theme =================
@@ -36,6 +36,11 @@ namespace Oscv
         public static Color TextDim = Color.FromArgb(124, 132, 144);
         public static Color BtnBg   = Color.FromArgb(44, 48, 54);
         public static Color BtnHot  = Color.FromArgb(64, 70, 79);
+        // 選ばれている画面のボタン。押し込まれた状態が一目で分かる程度の青
+        public static Color BtnSel  = Color.FromArgb(46, 90, 145);
+        // その画面が対応していない項目 (スライダーを沈める色)
+        public static Color Off     = Color.FromArgb(40, 43, 48);
+        public static Color OffKnob = Color.FromArgb(78, 84, 93);
         public static Color Ok      = Color.FromArgb(96, 200, 120);
         public static Color Busy    = Color.FromArgb(240, 180, 70);
         public static Color Err     = Color.FromArgb(230, 90, 90);
@@ -105,10 +110,27 @@ namespace Oscv
             public string szDescription;
         }
 
+        [StructLayout(LayoutKind.Sequential)]
+        struct RECT { public int left, top, right, bottom; }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        struct MONITORINFOEX
+        {
+            public int cbSize;
+            public RECT rcMonitor;
+            public RECT rcWork;
+            public int dwFlags;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
+            public string szDevice;   // \\.\DISPLAY2
+        }
+
         delegate bool MonitorEnumProc(IntPtr hMonitor, IntPtr hdc, IntPtr lprc, IntPtr data);
 
         [DllImport("user32.dll")]
         static extern bool EnumDisplayMonitors(IntPtr hdc, IntPtr clip, MonitorEnumProc cb, IntPtr data);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        static extern bool GetMonitorInfo(IntPtr hmon, ref MONITORINFOEX mi);
 
         [DllImport("dxva2.dll", SetLastError = true)]
         static extern bool GetNumberOfPhysicalMonitorsFromHMONITOR(IntPtr h, out uint n);
@@ -125,14 +147,38 @@ namespace Oscv
         [DllImport("dxva2.dll", SetLastError = true)]
         static extern bool SetVCPFeature(IntPtr h, byte code, uint val);
 
-        static IntPtr buf = IntPtr.Zero;   // native PHYSICAL_MONITOR[] we must destroy
-        static uint bufCount;
+        // 開いた 1 台ぶん。ハンドルは buf の中身なので、解放は CloseLocked がまとめて行う
+        class Phys
+        {
+            public IntPtr Handle;
+            public string Desc;
+            public int Num;      // \\.\DISPLAY2 の 2 = Windows の画面番号
+        }
+
+        static List<IntPtr> bufs = new List<IntPtr>();      // native PHYSICAL_MONITOR[] we must destroy
+        static List<uint> bufCounts = new List<uint>();
+        static List<Phys> phys = new List<Phys>();
         static IntPtr target = IntPtr.Zero;
         // 0 is a legitimate physical-monitor handle, so openness needs its own flag.
         static bool opened;
+        static int curNum = -1;    // いま掴んでいる画面番号
+        static int wantNum = -1;   // 選ばれている画面番号 (-1 = おまかせ)
         static readonly object gate = new object();
 
         public static bool IsOpen { get { return opened; } }
+        public static int CurrentNum { get { return curNum; } }
+
+        // "\\.\DISPLAY2" -> 2。取れなければ -1
+        public static int NumOf(string device)
+        {
+            if (device == null) return -1;
+            int i = device.Length;
+            while (i > 0 && device[i - 1] >= '0' && device[i - 1] <= '9') i--;
+            if (i >= device.Length) return -1;
+            int n;
+            return int.TryParse(device.Substring(i), NumberStyles.Integer,
+                                CultureInfo.InvariantCulture, out n) ? n : -1;
+        }
 
         // A single read costs ~60ms and fails outright maybe 1 time in 40.
         static int Raw(IntPtr h, byte code)
@@ -142,77 +188,115 @@ namespace Oscv
             return (int)cur;
         }
 
-        public static bool Open(byte probeVcp)
+        // want = 操作したい画面番号。-1 なら、ベンダー固有コードに答える板 (= LG) を選ぶ。
+        // 番号を指定したのにその画面が答えないときは、黙って別の画面を掴まない。
+        // 掴んだら、指定と違う板をいじってしまうより赤ランプの方がましなので失敗させる。
+        public static bool Open(byte probeVcp, int want)
         {
             lock (gate)
             {
-                CloseLocked();
-
-                List<IntPtr> hmons = new List<IntPtr>();
-                MonitorEnumProc cb = delegate(IntPtr hm, IntPtr hdc, IntPtr rc, IntPtr d)
-                { hmons.Add(hm); return true; };
-                EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, cb, IntPtr.Zero);
-
-                Dbg.W("Open: hmon=" + hmons.Count);
-                if (hmons.Count == 0) return false;
-
-                // Take the physical monitors of the first HMONITOR that has any.
-                int stride = Marshal.SizeOf(typeof(PHYSICAL_MONITOR));
-                for (int i = 0; i < hmons.Count && bufCount == 0; i++)
-                {
-                    uint n;
-                    if (!GetNumberOfPhysicalMonitorsFromHMONITOR(hmons[i], out n) || n == 0)
-                    { Dbg.W("  GetNumber failed err=" + Marshal.GetLastWin32Error()); continue; }
-
-                    IntPtr b = Marshal.AllocHGlobal(stride * (int)n);
-                    if (!GetPhysicalMonitorsFromHMONITOR(hmons[i], n, b))
-                    {
-                        Dbg.W("  GetPhysical failed err=" + Marshal.GetLastWin32Error());
-                        Marshal.FreeHGlobal(b);
-                        continue;
-                    }
-                    buf = b;
-                    bufCount = n;
-                }
-                Dbg.W("Open: physical=" + bufCount);
-                if (bufCount == 0) return false;
-
-                // Prefer the panel that answers the vendor-specific code - on a
-                // multi-monitor desk that is the LG one.
-                for (int pass = 0; pass < 2; pass++)
-                {
-                    byte code = pass == 0 ? probeVcp : (byte)0x10;
-                    for (int i = 0; i < bufCount; i++)
-                    {
-                        PHYSICAL_MONITOR pm = (PHYSICAL_MONITOR)Marshal.PtrToStructure(
-                            (IntPtr)(buf.ToInt64() + (long)i * stride), typeof(PHYSICAL_MONITOR));
-                        int v = Raw(pm.hPhysicalMonitor, code);
-                        Dbg.W("  probe[" + i + "] '" + pm.szDescription + "' h=" +
-                              pm.hPhysicalMonitor.ToInt64() + " vcp" + code.ToString("X2") +
-                              " -> " + v + (v < 0 ? " err=" + Marshal.GetLastWin32Error() : ""));
-                        if (v >= 0)
-                        {
-                            target = pm.hPhysicalMonitor;
-                            opened = true;
-                            return true;
-                        }
-                    }
-                }
-
-                Dbg.W("Open: FAILED");
-                return false;
+                wantNum = want;
+                return OpenLocked(probeVcp);
             }
+        }
+
+        // いま選ばれている画面のまま開き直す (寝起き・抜き差し・一時的な失敗から復帰する)
+        public static bool Reopen(byte probeVcp)
+        {
+            lock (gate) { return OpenLocked(probeVcp); }
+        }
+
+        static bool OpenLocked(byte probeVcp)
+        {
+            CloseLocked();
+
+            List<IntPtr> hmons = new List<IntPtr>();
+            MonitorEnumProc cb = delegate(IntPtr hm, IntPtr hdc, IntPtr rc, IntPtr d)
+            { hmons.Add(hm); return true; };
+            EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, cb, IntPtr.Zero);
+
+            Dbg.W("Open: hmon=" + hmons.Count + " want=" + wantNum);
+            if (hmons.Count == 0) return false;
+
+            // 画面ごとに物理モニターを開く。1 台目で止めない (v3 まではここで
+            // 止めていたので、2 台目以降が存在しないのと同じだった)。
+            // 同時に開いても、ハンドルは 1 台ずつ別の値が返る (実測: 0 と 2)
+            int stride = Marshal.SizeOf(typeof(PHYSICAL_MONITOR));
+            for (int i = 0; i < hmons.Count; i++)
+            {
+                MONITORINFOEX mi = new MONITORINFOEX();
+                mi.cbSize = Marshal.SizeOf(typeof(MONITORINFOEX));
+                mi.szDevice = "";
+                int num = GetMonitorInfo(hmons[i], ref mi) ? NumOf(mi.szDevice) : -1;
+
+                uint n;
+                if (!GetNumberOfPhysicalMonitorsFromHMONITOR(hmons[i], out n) || n == 0)
+                { Dbg.W("  GetNumber failed err=" + Marshal.GetLastWin32Error()); continue; }
+
+                IntPtr b = Marshal.AllocHGlobal(stride * (int)n);
+                if (!GetPhysicalMonitorsFromHMONITOR(hmons[i], n, b))
+                {
+                    Dbg.W("  GetPhysical failed err=" + Marshal.GetLastWin32Error());
+                    Marshal.FreeHGlobal(b);
+                    continue;
+                }
+                bufs.Add(b);
+                bufCounts.Add(n);
+
+                for (int j = 0; j < n; j++)
+                {
+                    PHYSICAL_MONITOR pm = (PHYSICAL_MONITOR)Marshal.PtrToStructure(
+                        (IntPtr)(b.ToInt64() + (long)j * stride), typeof(PHYSICAL_MONITOR));
+                    Phys p = new Phys();
+                    p.Handle = pm.hPhysicalMonitor;
+                    p.Desc = pm.szDescription;
+                    p.Num = num;
+                    phys.Add(p);
+                    Dbg.W("  found display" + num + " '" + p.Desc + "' h=" + p.Handle.ToInt64());
+                }
+            }
+            Dbg.W("Open: physical=" + phys.Count);
+            if (phys.Count == 0) return false;
+
+            // 指定が無ければ、ベンダー固有コードに答える板を優先する。
+            // 2 台つないだ机では、それが LG の方になる
+            for (int pass = 0; pass < 2; pass++)
+            {
+                byte code = pass == 0 ? probeVcp : (byte)0x10;
+                for (int i = 0; i < phys.Count; i++)
+                {
+                    if (wantNum >= 0 && phys[i].Num != wantNum) continue;
+                    int v = Raw(phys[i].Handle, code);
+                    Dbg.W("  probe display" + phys[i].Num + " h=" + phys[i].Handle.ToInt64() +
+                          " vcp" + code.ToString("X2") + " -> " + v +
+                          (v < 0 ? " err=" + Marshal.GetLastWin32Error() : ""));
+                    if (v >= 0)
+                    {
+                        target = phys[i].Handle;
+                        curNum = phys[i].Num;
+                        opened = true;
+                        return true;
+                    }
+                }
+            }
+
+            Dbg.W("Open: FAILED");
+            return false;
         }
 
         static void CloseLocked()
         {
             target = IntPtr.Zero;
             opened = false;
-            if (buf == IntPtr.Zero) return;
-            try { DestroyPhysicalMonitors(bufCount, buf); } catch { }
-            try { Marshal.FreeHGlobal(buf); } catch { }
-            buf = IntPtr.Zero;
-            bufCount = 0;
+            curNum = -1;
+            phys.Clear();
+            for (int i = 0; i < bufs.Count; i++)
+            {
+                try { DestroyPhysicalMonitors(bufCounts[i], bufs[i]); } catch { }
+                try { Marshal.FreeHGlobal(bufs[i]); } catch { }
+            }
+            bufs.Clear();
+            bufCounts.Clear();
         }
 
         public static void Close() { lock (gate) { CloseLocked(); } }
@@ -231,7 +315,7 @@ namespace Oscv
                 }
             }
             Dbg.W("  Read(" + code.ToString("X2") + ") retries exhausted, reopening");
-            if (!Open(probeVcp)) return -1;
+            if (!Reopen(probeVcp)) return -1;
             lock (gate)
             {
                 return opened ? Raw(target, code) : -1;
@@ -246,7 +330,7 @@ namespace Oscv
             {
                 if (opened && SetVCPFeature(target, code, (uint)val)) return true;
             }
-            if (!Open(probeVcp)) return false;
+            if (!Reopen(probeVcp)) return false;
             lock (gate)
             {
                 return opened && SetVCPFeature(target, code, (uint)val);
@@ -379,15 +463,18 @@ namespace Oscv
             int th = (int)Math.Round(6 * S);
             int px = PosOf(_value);
 
-            using (SolidBrush b = new SolidBrush(T.Track))
+            // その画面が持っていない項目は沈めて描く (触っても何も起きないことを見せる)
+            using (SolidBrush b = new SolidBrush(Enabled ? T.Track : T.Off))
                 Gfx.Round(g, b, TrackL, cy - th / 2, TrackR - TrackL, th, th);
-            using (SolidBrush b = new SolidBrush((_hot || _drag) ? T.FillHot : T.Fill))
-                Gfx.Round(g, b, TrackL, cy - th / 2, Math.Max(th, px - TrackL), th, th);
+            if (Enabled)
+                using (SolidBrush b = new SolidBrush((_hot || _drag) ? T.FillHot : T.Fill))
+                    Gfx.Round(g, b, TrackL, cy - th / 2, Math.Max(th, px - TrackL), th, th);
 
             int r = KnobR + ((_hot || _drag) ? (int)Math.Round(1.5 * S) : 0);
-            using (SolidBrush sh = new SolidBrush(Color.FromArgb(70, 0, 0, 0)))
-                g.FillEllipse(sh, px - r, cy - r + 1, r * 2, r * 2);
-            using (SolidBrush b = new SolidBrush(T.Knob))
+            if (Enabled)
+                using (SolidBrush sh = new SolidBrush(Color.FromArgb(70, 0, 0, 0)))
+                    g.FillEllipse(sh, px - r, cy - r + 1, r * 2, r * 2);
+            using (SolidBrush b = new SolidBrush(Enabled ? T.Knob : T.OffKnob))
                 g.FillEllipse(b, px - r, cy - r, r * 2, r * 2);
         }
     }
@@ -397,6 +484,7 @@ namespace Oscv
     {
         bool _hot;
         public int Flash;
+        public bool Selected;   // 画面切り替えボタンで、今いじっている画面を示す
         public event MouseEventHandler Clicked;
 
         public Btn()
@@ -420,7 +508,7 @@ namespace Oscv
             Graphics g = e.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
             g.Clear(Parent == null ? T.Bg : Parent.BackColor);
-            Color bg = Flash > 0 ? T.Fill : (_hot ? T.BtnHot : T.BtnBg);
+            Color bg = Flash > 0 ? T.Fill : (_hot ? T.BtnHot : (Selected ? T.BtnSel : T.BtnBg));
             using (SolidBrush b = new SolidBrush(bg))
                 Gfx.Round(g, b, 0, 0, Width, Height, (int)Math.Round(Height * 0.45));
             DrawGlyph(g, Flash > 0 ? Color.White : T.Text);
@@ -500,6 +588,8 @@ namespace Oscv
         Label[] lblName = new Label[N];
         Label[] lblVal = new Label[N];
         Btn[] presets = new Btn[3];
+        Btn[] monBtns = new Btn[0];   // 画面の切り替え (画面が 2 つ以上あるときだけ出す)
+        int[] monNums = new int[0];   // 上のボタンに対応する Windows の画面番号
         Panel header;
         Label title;
         Btn closeBtn;
@@ -509,6 +599,15 @@ namespace Oscv
         volatile string status = "init";
         volatile bool alive = true;
         volatile bool refreshWanted;
+
+        // 画面の切り替え。UI は番号を置いてワーカーを起こすだけで、
+        // 開き直しと読み直しはワーカー側でやる (DDC は 1 回 60ms かかる)
+        const int NoSwitch = -2;
+        volatile int wantMon = NoSwitch;
+        int curMon = -1;                 // いま操作している画面番号 (-1 = おまかせ)
+        readonly int startMon;           // 起動時に開く画面。ワーカーが読む
+        // その画面が持っている項目か。持っていない例: LG 以外の板の 0xF9
+        volatile bool[] avail = new bool[N] { true, true, true };
 
         readonly object gate = new object();
         int[] target = new int[N];
@@ -529,6 +628,14 @@ namespace Oscv
         public MainForm()
         {
             cfg = Cfg.Load();
+
+            // 前回いじっていた画面を引き継ぐ。抜かれていたら、おまかせに戻す
+            // (指定を残したままだと、その画面が見つからず赤ランプのままになる)
+            curMon = cfg.Display;
+            if (curMon >= 0 && !DisplayExists(curMon)) curMon = -1;
+            cfg.Prefix = PrefixOf(curMon);
+            startMon = curMon;
+
             using (Graphics g = Graphics.FromHwnd(IntPtr.Zero)) S = g.DpiX / 96f;
 
             FormBorderStyle = FormBorderStyle.None;
@@ -543,6 +650,7 @@ namespace Oscv
                     presetVals[i, j] = cfg.Preset(i, j);
 
             BuildUi();
+            MarkMonButtons();
 
             TopMost = cfg.Pin;
             UpdatePin();
@@ -585,6 +693,104 @@ namespace Oscv
                     if (s != null) Icon = new Icon(s);
             }
             catch { }  // アイコンが無くても起動はできる
+        }
+
+        // ---------- 画面の選択 ----------
+
+        // 左から右 (同じ位置なら上から下) に並べる。ボタンの並び順が机の上の
+        // 並びと一致していれば、番号を覚えていなくても見当がつく
+        static Screen[] Displays()
+        {
+            List<Screen> l = new List<Screen>(Screen.AllScreens);
+            l.Sort(delegate(Screen a, Screen b)
+            {
+                if (a.Bounds.X != b.Bounds.X) return a.Bounds.X - b.Bounds.X;
+                return a.Bounds.Y - b.Bounds.Y;
+            });
+            return l.ToArray();
+        }
+
+        static bool DisplayExists(int num)
+        {
+            foreach (Screen s in Screen.AllScreens)
+                if (Ddc.NumOf(s.DeviceName) == num) return true;
+            return false;
+        }
+
+        // ini のキーを画面ごとに分ける。番号が決まらないうち (おまかせ) は
+        // v3 までのキーをそのまま使う
+        static string PrefixOf(int num)
+        {
+            return num < 0 ? "" : "m" + num.ToString(CultureInfo.InvariantCulture) + ".";
+        }
+
+        // 最終値もプリセットも画面ごとに持つ。板が違えば同じ「強」でも
+        // ちょうどいい値は違うため
+        void UseMonitor(int num)
+        {
+            curMon = num;
+            cfg.Prefix = PrefixOf(num);
+            for (int p = 0; p < 3; p++)
+                for (int i = 0; i < N; i++) presetVals[p, i] = cfg.Preset(p, i);
+            MarkMonButtons();
+        }
+
+        void MarkMonButtons()
+        {
+            for (int i = 0; i < monBtns.Length; i++)
+            {
+                bool on = monNums[i] == curMon;
+                if (monBtns[i].Selected == on) continue;
+                monBtns[i].Selected = on;
+                monBtns[i].Invalidate();
+            }
+        }
+
+        void OnMonitor(int idx, MouseEventArgs e)
+        {
+            if (e.Button != MouseButtons.Left) return;
+            int num = monNums[idx];
+            if (num == curMon) return;
+
+            // いま表示している値は前の画面のもの。書きかけを捨ててから切り替える
+            lock (gate)
+            {
+                for (int i = 0; i < N; i++)
+                {
+                    dirty[i] = false;
+                    touched[i] = false;
+                    applied[i] = -1;   // 実値が読めるまで「不明」。次の書き込みを抑えない
+                }
+            }
+
+            cfg.Display = num;
+            UseMonitor(num);
+
+            // 種は ini の最終値。実値は 200ms 後にワーカーが上書きする
+            for (int i = 0; i < N; i++)
+            {
+                SetAvail(i, true);
+                int v = cfg.Last(i, CH[i].Min, CH[i].Max);
+                sl[i].SetValueSilent(v);
+                lblVal[i].Text = v.ToString(CultureInfo.InvariantCulture);
+                lock (gate) target[i] = v;
+            }
+
+            SetStatus("busy");
+            wantMon = num;
+            signal.Set();
+        }
+
+        // 対応していない項目は沈めて触れなくする。書けば必ず失敗するので、
+        // 赤ランプを出し続けるよりこの方が正しい
+        void SetAvail(int i, bool on)
+        {
+            avail[i] = on;
+            sl[i].Enabled = on;
+            sl[i].Invalidate();
+            lblName[i].ForeColor = on ? T.Label : T.TextDim;
+            lblVal[i].ForeColor = on ? T.Text : T.TextDim;
+            if (!on) lblVal[i].Text = "―";
         }
 
         Point DefaultPos()
@@ -644,6 +850,44 @@ namespace Oscv
             header.Controls.Add(closeBtn);
 
             int y = hh + Sc(10);
+
+            // 画面が 2 つ以上あるときだけ切り替えの列を出す。1 つなら v3 までと同じ窓
+            Screen[] scr = Displays();
+            if (scr.Length > 1)
+            {
+                Label pick = new Label();
+                pick.AutoSize = false;
+                pick.Bounds = new Rectangle(pad, y, Sc(34), Sc(24));
+                pick.ForeColor = T.Label;
+                pick.Text = "画面";
+                pick.TextAlign = ContentAlignment.MiddleLeft;
+                pick.Font = new Font(Font.FontFamily, 8.5f);
+                Controls.Add(pick);
+
+                int bx = pad + Sc(38);
+                int gap = Sc(6);
+                int bw2 = (W - pad - bx - gap * (scr.Length - 1)) / scr.Length;
+                monBtns = new Btn[scr.Length];
+                monNums = new int[scr.Length];
+                ToolTip tip = new ToolTip();
+                for (int i = 0; i < scr.Length; i++)
+                {
+                    int idx = i;
+                    monNums[i] = Ddc.NumOf(scr[i].DeviceName);
+                    monBtns[i] = new Btn();
+                    monBtns[i].Bounds = new Rectangle(bx + i * (bw2 + gap), y, bw2, Sc(24));
+                    monBtns[i].Text = monNums[i].ToString(CultureInfo.InvariantCulture);
+                    monBtns[i].Font = new Font(Font.FontFamily, 8.5f);
+                    monBtns[i].Clicked += delegate(object s, MouseEventArgs e) { OnMonitor(idx, e); };
+                    // 同じ型の板が 2 枚並ぶと番号だけでは分からないので、大きさも出す
+                    tip.SetToolTip(monBtns[i], "ディスプレイ " + monNums[i] + "  " +
+                        scr[i].Bounds.Width + " x " + scr[i].Bounds.Height +
+                        (scr[i].Primary ? " (メイン)" : ""));
+                    Controls.Add(monBtns[i]);
+                }
+                y += Sc(24) + Sc(12);
+            }
+
             for (int i = 0; i < N; i++)
             {
                 int idx = i;
@@ -797,7 +1041,8 @@ namespace Oscv
         {
             if (e.Button == MouseButtons.Right)
             {
-                for (int i = 0; i < N; i++) presetVals[p, i] = sl[i].Value;
+                // 沈んでいる項目はこの画面に無い。前の値をそのまま残す
+                for (int i = 0; i < N; i++) if (avail[i]) presetVals[p, i] = sl[i].Value;
                 cfg.SavePreset(p, presetVals);
                 presets[p].Flash = 5;
                 presets[p].Invalidate();
@@ -807,6 +1052,7 @@ namespace Oscv
 
             for (int i = 0; i < N; i++)
             {
+                if (!avail[i]) continue;
                 sl[i].Value = presetVals[p, i];
                 touched[i] = true;
                 lblVal[i].Text = sl[i].Value.ToString(CultureInfo.InvariantCulture);
@@ -836,10 +1082,17 @@ namespace Oscv
             for (int i = 0; i < N; i++)
             {
                 if (HasPending()) return true;   // user is driving; their value wins
+                if (!avail[i]) continue;         // この画面には無い項目
 
                 int raw = Ddc.Read(CH[i].Vcp, ProbeVcp);
                 Dbg.W("ReadAll " + CH[i].Label + " vcp" + CH[i].Vcp.ToString("X2") + " -> " + raw);
-                if (raw < 0) continue;
+                if (raw < 0)
+                {
+                    // 他の項目が読めているなら線は生きている。この項目だけが
+                    // 無い板ということなので、沈めて触れなくする
+                    if (healthy) MarkMissing(i);
+                    continue;
+                }
                 healthy = true;
 
                 int v = (int)Math.Round((double)raw / CH[i].GetDiv);
@@ -866,10 +1119,30 @@ namespace Oscv
             return healthy;
         }
 
+        // ワーカー側から。UI の更新だけ投げ、判定はその場で持つ
+        // (次の ReadAll がまた 700ms かけて読みに行かないように)
+        void MarkMissing(int i)
+        {
+            if (!avail[i]) return;
+            avail[i] = false;
+            Dbg.W("  display" + Ddc.CurrentNum + " has no vcp" + CH[i].Vcp.ToString("X2"));
+            try { BeginInvoke((MethodInvoker)delegate { SetAvail(i, false); }); } catch { }
+        }
+
+        // おまかせで開いたときは、どの画面になったかを UI に伝える
+        // (ini のキーとボタンの点灯がそれで決まる)
+        void SyncSelection()
+        {
+            int n = Ddc.CurrentNum;
+            if (n < 0 || n == curMon) return;
+            try { BeginInvoke((MethodInvoker)delegate { UseMonitor(n); }); } catch { }
+        }
+
         void WorkerLoop()
         {
             SetStatus("busy");
-            SetStatus(Ddc.Open(ProbeVcp) && ReadAll() ? "ok" : "err");
+            SetStatus(Ddc.Open(ProbeVcp, startMon) && ReadAll() ? "ok" : "err");
+            SyncSelection();
 
             int lastHeal = Environment.TickCount;
 
@@ -890,7 +1163,16 @@ namespace Oscv
                 {
                     if (closing) break;
 
-                    if (refreshWanted)
+                    int mw = wantMon;
+                    if (mw != NoSwitch)
+                    {
+                        // 画面の切り替え。掴み直して、その板の実値を読み直す
+                        wantMon = NoSwitch;
+                        SetStatus("busy");
+                        for (int i = 0; i < N; i++) { touched[i] = false; avail[i] = true; }
+                        SetStatus(Ddc.Open(ProbeVcp, mw) && ReadAll() ? "ok" : "err");
+                    }
+                    else if (refreshWanted)
                     {
                         refreshWanted = false;
                         for (int i = 0; i < N; i++) touched[i] = false;
@@ -900,7 +1182,8 @@ namespace Oscv
                     {
                         // cable replugged / monitor woke up / DDC re-enabled
                         lastHeal = Environment.TickCount;
-                        SetStatus(Ddc.Open(ProbeVcp) && ReadAll() ? "ok" : "err");
+                        SetStatus(Ddc.Reopen(ProbeVcp) && ReadAll() ? "ok" : "err");
+                        SyncSelection();
                     }
 
                     signal.WaitOne(500);
@@ -940,7 +1223,7 @@ namespace Oscv
             cfg.X = Location.X;
             cfg.Y = Location.Y;
             cfg.Pin = TopMost;
-            for (int i = 0; i < N; i++) cfg.SetLast(i, sl[i].Value);
+            for (int i = 0; i < N; i++) if (avail[i]) cfg.SetLast(i, sl[i].Value);
             cfg.Save();
 
             if (!workerDone && HasPending())
@@ -1021,12 +1304,28 @@ namespace Oscv
             }
         }
 
+        // 画面ごとに分けるキーの接頭辞 ("m2." など)。空なら v3 までのキー
+        public string Prefix = "";
+
         int GetI(string k, int def)
         {
             string s;
             if (!d.TryGetValue(k, out s)) return def;
             int v;
             return int.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out v) ? v : def;
+        }
+
+        // 画面ごとの値。まだ無ければ番号なしの旧キーを引き継ぐ。
+        // 2 台目を挿した日に、1 台目で育てたプリセットがそのまま出発点になる
+        int GetPer(string k, int def)
+        {
+            if (Prefix.Length > 0 && d.ContainsKey(Prefix + k)) return GetI(Prefix + k, def);
+            return GetI(k, def);
+        }
+
+        void SetPer(string k, int v)
+        {
+            d[Prefix + k] = v.ToString(CultureInfo.InvariantCulture);
         }
 
         public int X
@@ -1047,23 +1346,29 @@ namespace Oscv
             set { d["pin"] = value ? "1" : "0"; }
         }
 
+        // 操作する画面。-1 = おまかせ (ベンダー固有コードに答える板を選ぶ)
+        public int Display
+        {
+            get { return GetI("display", -1); }
+            set { d["display"] = value.ToString(CultureInfo.InvariantCulture); }
+        }
+
         public int Last(int i, int min, int max)
         {
-            int v = GetI("last" + i, (min + max) / 2);
+            int v = GetPer("last" + i, (min + max) / 2);
             return v < min ? min : (v > max ? max : v);
         }
 
         public void SetLast(int i, int v)
         {
-            d["last" + i] = v.ToString(CultureInfo.InvariantCulture);
+            SetPer("last" + i, v);
         }
 
-        public int Preset(int p, int i) { return GetI("preset" + p + "_" + i, DefPreset[p, i]); }
+        public int Preset(int p, int i) { return GetPer("preset" + p + "_" + i, DefPreset[p, i]); }
 
         public void SavePreset(int p, int[,] vals)
         {
-            for (int i = 0; i < 3; i++)
-                d["preset" + p + "_" + i] = vals[p, i].ToString(CultureInfo.InvariantCulture);
+            for (int i = 0; i < 3; i++) SetPer("preset" + p + "_" + i, vals[p, i]);
             Save();
         }
 
