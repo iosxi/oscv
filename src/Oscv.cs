@@ -12,6 +12,12 @@ using System.Windows.Forms;
 
 namespace Oscv
 {
+    static class App
+    {
+        // 版番号はここが唯一の出どころ (build.ps1 が読む)。v1 から 1 ずつ上げる。
+        public const int Version = 1;
+    }
+
     // ================= theme =================
     static class T
     {
@@ -546,7 +552,7 @@ namespace Oscv
             title.TextAlign = ContentAlignment.MiddleLeft;
             title.ForeColor = T.TextDim;
             title.BackColor = Color.Transparent;
-            title.Text = "OSCV";
+            title.Text = "OSCV v" + App.Version.ToString(CultureInfo.InvariantCulture);
             title.Font = new Font(Font.FontFamily, 8.5f, FontStyle.Bold);
             title.MouseDown += HeaderDown;
             title.MouseMove += HeaderMove;

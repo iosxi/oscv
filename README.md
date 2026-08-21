@@ -92,11 +92,37 @@ exe と同じ場所に `debug.on` という空ファイルを置くと `oscv-deb
 - 別のモニター制御ソフト（OnScreen Control 含む）が同時に DDC を叩いている
 - 変換アダプタや KVM が DDC を通さない
 
-## ビルド
+## ビルドと配布
 
 ```
-build.bat
+powershell -ExecutionPolicy Bypass -File build.ps1
 ```
 
+`build.bat` をダブルクリックしても同じ（中で build.ps1 を呼ぶだけ）。
 .NET SDK 不要。Windows 同梱の `csc.exe`（.NET Framework 4）だけでビルドできる。
 ソースは [src/Oscv.cs](src/Oscv.cs) 1 ファイル。
+
+出来上がるもの:
+
+| | |
+|---|---|
+| `Oscv.exe` | そのまま動く実行ファイル（ショートカットの向き先） |
+| `dist\OSCV-<版>.zip` | 配布用。中は `OSCV-<版>\` の 1 階層に `Oscv.exe` と `README.txt` |
+
+`dist/` はリポジトリに含めない。配布物は GitHub のリリースに添付する。
+古い zip は新しい方から 3 個だけ残る。
+
+### 版番号
+
+**`src/Oscv.cs` の `App.Version` が唯一の出どころ。** v1 から 1 ずつ上げる。
+build.ps1 がここを読んで zip 名を決め、`README.txt` の `@VERSION@` を置換する。
+ウィンドウのヘッダーにも `OSCV v1` として出る。
+
+修正したら `App.Version` を 1 つ上げてからビルドする。
+
+### ビルド時のガード
+
+古いバイナリを新しい版番号で配ってしまう事故を防ぐため、build.ps1 は次を確認する:
+
+- Oscv.exe が起動中なら中断する（起動中の exe は上書きできない）
+- ビルド後、exe の更新時刻が開始時刻より古ければ中断する

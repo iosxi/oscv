@@ -4,3 +4,7 @@ oscv.ini
 # トラブルシュート用（debug.on を置くと出力される）
 debug.on
 oscv-debug.log
+
+# build.ps1 の出力（配布物はリポジトリに置かず、リリースに添付する）
+build/
+dist/
