@@ -1,9 +1,9 @@
-﻿# OSCV をビルドして、README.txt と一緒に zip にする。
+﻿# oscv をビルドして、README.txt と一緒に zip にする。
 #   powershell -ExecutionPolicy Bypass -File build.ps1
 #
 # 出来上がるもの:
-#   Oscv.exe                  そのまま動く実行ファイル (ショートカットの向き先)
-#   dist\OSCV-<版>.zip        配布用 (OSCV-<版>\ の中に Oscv.exe と README.txt)
+#   oscv.exe                  そのまま動く実行ファイル (ショートカットの向き先)
+#   dist\oscv-<版>.zip        配布用 (oscv-<版>\ の中に oscv.exe と README.txt)
 #
 # 古い zip は新しい方から KEEP_ZIPS 個だけ残し、それより古いものは消す。
 
@@ -22,19 +22,19 @@ if (-not (Test-Path $csc)) {
 
 # 動いている exe は上書きできない。先に気づかないと、古い exe が新しい
 # 版番号の zip に入ってしまう
-$running = Get-Process -Name Oscv -ErrorAction SilentlyContinue
+$running = Get-Process -Name oscv -ErrorAction SilentlyContinue
 if ($running) {
-    throw "Oscv が起動中です (PID $($running.Id -join ', '))。終了してからビルドしてください。"
+    throw "oscv が起動中です (PID $($running.Id -join ', '))。終了してからビルドしてください。"
 }
 
-# 版番号は src\Oscv.cs の App.Version を唯一の出どころにする (v1 から 1 ずつ)
-$src = Join-Path $root 'src\Oscv.cs'
+# 版番号は src\oscv.cs の App.Version を唯一の出どころにする (v1 から 1 ずつ)
+$src = Join-Path $root 'src\oscv.cs'
 $m = [regex]::Match([IO.File]::ReadAllText($src), 'public const int Version\s*=\s*(\d+)\s*;')
-if (-not $m.Success) { throw "src\Oscv.cs に App.Version が見つかりません。" }
+if (-not $m.Success) { throw "src\oscv.cs に App.Version が見つかりません。" }
 $version = 'v' + $m.Groups[1].Value
-Write-Host "OSCV $version をビルドします"
+Write-Host "oscv $version をビルドします"
 
-$exe = Join-Path $root 'Oscv.exe'
+$exe = Join-Path $root 'oscv.exe'
 $dist = Join-Path $root 'dist'
 $work = Join-Path $root 'build'
 $started = Get-Date
@@ -54,25 +54,25 @@ if ((Get-Item $exe).LastWriteTime -lt $started) {
 
 New-Item -ItemType Directory -Force $dist | Out-Null
 
-# zip の中は OSCV-<版>\ の 1 階層にまとめる (展開時に散らからないように)
-$stage = Join-Path $work "package\OSCV-$version"
+# zip の中は oscv-<版>\ の 1 階層にまとめる (展開時に散らからないように)
+$stage = Join-Path $work "package\oscv-$version"
 if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
 New-Item -ItemType Directory -Force $stage | Out-Null
 Copy-Item $exe $stage
 
-# README.txt の版番号は置換で埋める (Oscv.cs と二重管理にしないため)
+# README.txt の版番号は置換で埋める (oscv.cs と二重管理にしないため)
 $readme = [IO.File]::ReadAllText((Join-Path $root 'README.txt'))
 if ($readme -notmatch '@VERSION@') { throw 'README.txt に @VERSION@ がありません。' }
 $readme = $readme -replace '@VERSION@', $version.TrimStart('v')
 [IO.File]::WriteAllText((Join-Path $stage 'README.txt'), $readme, (New-Object Text.UTF8Encoding $true))
 
-$zip = Join-Path $dist "OSCV-$version.zip"
+$zip = Join-Path $dist "oscv-$version.zip"
 if (Test-Path $zip) { Remove-Item -Force $zip }
 Compress-Archive -Path $stage -DestinationPath $zip
 
 # 古い配布物は溜め込まない。名前順だと v10 が v9 より前に来てしまうので、
 # 作られた順で見る
-$stale = Get-ChildItem -Path $dist -Filter 'OSCV-v*.zip' |
+$stale = Get-ChildItem -Path $dist -Filter 'oscv-v*.zip' |
     Sort-Object LastWriteTime -Descending | Select-Object -Skip $KEEP_ZIPS
 foreach ($file in $stale) {
     Write-Host "古い配布物を消します: $($file.Name)"

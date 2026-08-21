@@ -15,7 +15,7 @@ namespace Oscv
     static class App
     {
         // 版番号はここが唯一の出どころ (build.ps1 が読む)。v1 から 1 ずつ上げる。
-        public const int Version = 1;
+        public const int Version = 2;
     }
 
     // ================= theme =================
@@ -28,6 +28,10 @@ namespace Oscv
         public static Color FillHot = Color.FromArgb(134, 194, 255);
         public static Color Knob    = Color.FromArgb(238, 242, 247);
         public static Color Text    = Color.FromArgb(216, 222, 230);
+        // 項目名。暗い部屋で読めるよう背景 Bg に対して約 9.7:1 を確保する
+        // (以前の TextDim は 4.4:1 で AA にも届いていなかった)
+        public static Color Label   = Color.FromArgb(190, 198, 210);
+        // ヘッダーのタイトルなど、内容ではない飾りだけに使う
         public static Color TextDim = Color.FromArgb(124, 132, 144);
         public static Color BtnBg   = Color.FromArgb(44, 48, 54);
         public static Color BtnHot  = Color.FromArgb(64, 70, 79);
@@ -418,9 +422,60 @@ namespace Oscv
             Color bg = Flash > 0 ? T.Fill : (_hot ? T.BtnHot : T.BtnBg);
             using (SolidBrush b = new SolidBrush(bg))
                 Gfx.Round(g, b, 0, 0, Width, Height, (int)Math.Round(Height * 0.45));
-            TextRenderer.DrawText(g, Text, Font, new Rectangle(0, 0, Width, Height),
-                Flash > 0 ? Color.White : T.Text,
+            DrawGlyph(g, Flash > 0 ? Color.White : T.Text);
+        }
+
+        protected virtual void DrawGlyph(Graphics g, Color fg)
+        {
+            TextRenderer.DrawText(g, Text, Font, new Rectangle(0, 0, Width, Height), fg,
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+        }
+    }
+
+    // ================= pin toggle =================
+    // 押しピンの絵で最前面固定の状態を示す。
+    //   留めている : 白く塗って斜めに倒す
+    //   外している : 輪郭だけにして真横に倒す
+    class PinBtn : Btn
+    {
+        public bool Pinned;
+
+        // 24 単位四方の中に、針を下に向けた押しピンの輪郭を 1 本の閉じた線で組む。
+        // 頭・胴・つば・針を別々の図形で重ねると、輪郭表示のときに内側の線が
+        // 出てしまうので、最初から 1 つの多角形にしてある。
+        static readonly PointF[] Shape = new PointF[] {
+            new PointF( 8.5f,  2.0f), new PointF(15.5f,  2.0f),   // 頭
+            new PointF(15.5f,  5.5f), new PointF(16.5f, 14.0f),   // 胴 (下ほど広がる)
+            new PointF(18.0f, 14.0f), new PointF(18.0f, 16.5f),   // つば 右
+            new PointF(12.9f, 16.5f), new PointF(12.0f, 22.0f),   // 針
+            new PointF(11.1f, 16.5f),
+            new PointF( 6.0f, 16.5f), new PointF( 6.0f, 14.0f),   // つば 左
+            new PointF( 7.5f, 14.0f), new PointF( 8.5f,  5.5f)
+        };
+
+        protected override void DrawGlyph(Graphics g, Color fg)
+        {
+            float scale = Math.Min(Width, Height) / 24f;
+            GraphicsState st = g.Save();
+            g.TranslateTransform(Width / 2f, Height / 2f);
+            g.RotateTransform(Pinned ? -45f : -90f);
+            g.ScaleTransform(scale, scale);
+            g.TranslateTransform(-12f, -12f);
+
+            using (GraphicsPath p = new GraphicsPath())
+            {
+                p.AddPolygon(Shape);
+                if (Pinned)
+                {
+                    using (SolidBrush b = new SolidBrush(Color.White)) g.FillPath(b, p);
+                }
+                else
+                {
+                    // 線幅も一緒に拡縮されるので、実寸で約 1.2px になるよう割り戻す
+                    using (Pen pen = new Pen(fg, 1.2f / scale)) g.DrawPath(pen, p);
+                }
+            }
+            g.Restore(st);
         }
     }
 
@@ -446,7 +501,8 @@ namespace Oscv
         Btn[] presets = new Btn[3];
         Panel header;
         Label title;
-        Btn closeBtn, pinBtn;
+        Btn closeBtn;
+        PinBtn pinBtn;
         System.Windows.Forms.Timer flashTimer;
 
         volatile string status = "init";
@@ -533,7 +589,7 @@ namespace Oscv
 
         void BuildUi()
         {
-            int W = Sc(280);
+            int W = Sc(250);
             int pad = Sc(15);
             int hh = Sc(26);
 
@@ -552,16 +608,15 @@ namespace Oscv
             title.TextAlign = ContentAlignment.MiddleLeft;
             title.ForeColor = T.TextDim;
             title.BackColor = Color.Transparent;
-            title.Text = "OSCV v" + App.Version.ToString(CultureInfo.InvariantCulture);
+            title.Text = "oscv v" + App.Version.ToString(CultureInfo.InvariantCulture);
             title.Font = new Font(Font.FontFamily, 8.5f, FontStyle.Bold);
             title.MouseDown += HeaderDown;
             title.MouseMove += HeaderMove;
             title.MouseUp += HeaderUp;
             header.Controls.Add(title);
 
-            pinBtn = new Btn();
+            pinBtn = new PinBtn();
             pinBtn.Bounds = new Rectangle(W - Sc(56), Sc(4), Sc(24), hh - Sc(8));
-            pinBtn.Font = new Font(Font.FontFamily, 8f);
             pinBtn.Clicked += OnPin;
             header.Controls.Add(pinBtn);
 
@@ -580,7 +635,7 @@ namespace Oscv
                 lblName[i] = new Label();
                 lblName[i].AutoSize = false;
                 lblName[i].Bounds = new Rectangle(pad, y, W - pad * 2 - Sc(46), Sc(17));
-                lblName[i].ForeColor = T.TextDim;
+                lblName[i].ForeColor = T.Label;
                 lblName[i].Text = CH[i].Label;
                 lblName[i].TextAlign = ContentAlignment.MiddleLeft;
                 lblName[i].Font = new Font(Font.FontFamily, 8.5f);
@@ -641,7 +696,7 @@ namespace Oscv
 
         void UpdatePin()
         {
-            pinBtn.Text = TopMost ? "◆" : "◇";
+            pinBtn.Pinned = TopMost;
             pinBtn.Invalidate();
         }
 
