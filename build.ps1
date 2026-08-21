@@ -39,8 +39,16 @@ $dist = Join-Path $root 'dist'
 $work = Join-Path $root 'build'
 $started = Get-Date
 
+# ico は 2 か所で使う。win32icon = エクスプローラーやショートカットに出る exe の顔、
+# resource = 実行時にウィンドウとタスクバーへ出すもの (oscv.cs の SetAppIcon が読む)。
+# 絵を差し替えるときは tools\make-icon.ps1 で ico を作り直す
+$icon = Join-Path $root 'assets\oscv.ico'
+if (-not (Test-Path $icon)) { throw "assets\oscv.ico がありません。tools\make-icon.ps1 で作ってください。" }
+
 & $csc /nologo /target:winexe /optimize+ /codepage:65001 `
     /out:$exe `
+    /win32icon:$icon `
+    /resource:"$icon,oscv.ico" `
     /reference:System.dll `
     /reference:System.Drawing.dll `
     /reference:System.Windows.Forms.dll `

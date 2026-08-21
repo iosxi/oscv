@@ -4,6 +4,7 @@ using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Globalization;
 using System.IO;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -15,7 +16,7 @@ namespace Oscv
     static class App
     {
         // 版番号はここが唯一の出どころ (build.ps1 が読む)。v1 から 1 ずつ上げる。
-        public const int Version = 2;
+        public const int Version = 3;
     }
 
     // ================= theme =================
@@ -534,6 +535,7 @@ namespace Oscv
             StartPosition = FormStartPosition.Manual;
             BackColor = T.Bg;
             Text = "OSCV";
+            SetAppIcon();
             Font = new Font("Yu Gothic UI", 9f, FontStyle.Regular, GraphicsUnit.Point);
 
             for (int i = 0; i < 3; i++)
@@ -569,6 +571,20 @@ namespace Oscv
             worker = new Thread(WorkerLoop);
             worker.IsBackground = false;
             worker.Start();
+        }
+
+        // アイコンは exe に埋め込んだ ico をそのまま Icon に渡す。ico のまま渡せば
+        // タスクバー用の 16px を WinForms がその大きさの絵から選ぶ (Bitmap 経由や
+        // ExtractAssociatedIcon だと 32px を縮めるだけになって滲む)。
+        // 埋め込みは build.ps1 の /resource:assets\oscv.ico,oscv.ico で行う。
+        void SetAppIcon()
+        {
+            try
+            {
+                using (Stream s = Assembly.GetExecutingAssembly().GetManifestResourceStream("oscv.ico"))
+                    if (s != null) Icon = new Icon(s);
+            }
+            catch { }  // アイコンが無くても起動はできる
         }
 
         Point DefaultPos()

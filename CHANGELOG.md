@@ -2,6 +2,13 @@
 
 版番号は `src/oscv.cs` の `App.Version` が唯一の出どころ。v1 から 1 ずつ上げる。
 
+## v3
+
+- アプリのアイコンを付けた。エクスプローラーやショートカットに出る exe の顔と、
+  ウィンドウ・タスクバー・Alt+Tab に出るアイコンの両方。
+  元絵は `assets/icon_SRC.png`、ico の作り直しは `tools/make-icon.ps1`
+- ico を埋め込んだぶん実行ファイルが 26KB → 108KB になった
+
 ## v2
 
 - 名前の表記を全て小文字に統一（`oscv.exe`、`dist\oscv-v2.zip`、
