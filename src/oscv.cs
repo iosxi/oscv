@@ -16,7 +16,7 @@ namespace Oscv
     static class App
     {
         // 版番号はここが唯一の出どころ (build.ps1 が読む)。v1 から 1 ずつ上げる。
-        public const int Version = 4;
+        public const int Version = 5;
     }
 
     // ================= theme =================
@@ -178,6 +178,30 @@ namespace Oscv
             int n;
             return int.TryParse(device.Substring(i), NumberStyles.Integer,
                                 CultureInfo.InvariantCulture, out n) ? n : -1;
+        }
+
+        // その画面が DDC に答えるか。開いてあるハンドルで読むだけなので、
+        // いま掴んでいる板は動かさない。
+        // codes のどれか 1 つでも答えれば生きているとみなす。読み取りは 2.5% で
+        // 空振りするが、3 つ続けて空振りする確率は 1/64000 なので、
+        // 複数のコードを試すこと自体がリトライになっている
+        public static bool Alive(int num, byte[] codes)
+        {
+            lock (gate)
+            {
+                for (int i = 0; i < phys.Count; i++)
+                {
+                    if (phys[i].Num != num) continue;
+                    for (int c = 0; c < codes.Length; c++)
+                    {
+                        if (Raw(phys[i].Handle, codes[c]) < 0) continue;
+                        Dbg.W("  display" + num + " alive (vcp" + codes[c].ToString("X2") + ")");
+                        return true;
+                    }
+                }
+                Dbg.W("  display" + num + " does not answer");
+                return false;
+            }
         }
 
         // A single read costs ~60ms and fails outright maybe 1 time in 40.
@@ -508,10 +532,11 @@ namespace Oscv
             Graphics g = e.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
             g.Clear(Parent == null ? T.Bg : Parent.BackColor);
-            Color bg = Flash > 0 ? T.Fill : (_hot ? T.BtnHot : (Selected ? T.BtnSel : T.BtnBg));
+            Color bg = !Enabled ? T.Off
+                     : (Flash > 0 ? T.Fill : (_hot ? T.BtnHot : (Selected ? T.BtnSel : T.BtnBg)));
             using (SolidBrush b = new SolidBrush(bg))
                 Gfx.Round(g, b, 0, 0, Width, Height, (int)Math.Round(Height * 0.45));
-            DrawGlyph(g, Flash > 0 ? Color.White : T.Text);
+            DrawGlyph(g, !Enabled ? T.OffKnob : (Flash > 0 ? Color.White : T.Text));
         }
 
         protected virtual void DrawGlyph(Graphics g, Color fg)
@@ -582,6 +607,17 @@ namespace Oscv
         };
         const byte ProbeVcp = 0xF9;
 
+        // 画面の生死判定に使う VCP。扱っている項目をそのまま使う。
+        // どれにも答えない板は、電源が落ちているか DDC で触れない板なので選ばせない
+        static readonly byte[] ProbeCodes = MakeProbeCodes();
+
+        static byte[] MakeProbeCodes()
+        {
+            byte[] b = new byte[N];
+            for (int i = 0; i < N; i++) b[i] = CH[i].Vcp;
+            return b;
+        }
+
         const int N = 3;
         float S = 1f;
         Slider[] sl = new Slider[N];
@@ -590,6 +626,9 @@ namespace Oscv
         Btn[] presets = new Btn[3];
         Btn[] monBtns = new Btn[0];   // 画面の切り替え (画面が 2 つ以上あるときだけ出す)
         int[] monNums = new int[0];   // 上のボタンに対応する Windows の画面番号
+        bool[] monLive = new bool[0]; // DDC に答えるか。答えない画面は非活性にする
+        string[] monTipText = new string[0];
+        ToolTip monTip;
         Panel header;
         Label title;
         Btn closeBtn;
@@ -746,9 +785,39 @@ namespace Oscv
             }
         }
 
+        // 答えない画面のボタンを非活性にする。電源が落ちている板や、DDC を
+        // 通さないアダプタの先の板を選ばせても、赤ランプになるだけなので
+        void SetMonLive(int i, bool live)
+        {
+            monLive[i] = live;
+            monBtns[i].Enabled = live;
+            monBtns[i].Invalidate();
+            monTip.SetToolTip(monBtns[i], monTipText[i] + (live ? "" : "  応答なし"));
+        }
+
+        // ワーカーから。onlyDead なら、いま死んでいる画面だけ見に行く
+        // (生きている画面を毎回叩くと、前面に出すたびに 60ms x 台数を捨てることになる)
+        void ProbeDisplays(bool onlyDead)
+        {
+            for (int i = 0; i < monNums.Length; i++)
+            {
+                if (onlyDead && monLive[i]) continue;
+
+                // いま掴めている板は、読めている時点で生きている
+                bool live = (Ddc.IsOpen && monNums[i] == Ddc.CurrentNum)
+                            || Ddc.Alive(monNums[i], ProbeCodes);
+                if (live == monLive[i]) continue;
+
+                int idx = i;
+                try { BeginInvoke((MethodInvoker)delegate { SetMonLive(idx, live); }); }
+                catch { }
+            }
+        }
+
         void OnMonitor(int idx, MouseEventArgs e)
         {
             if (e.Button != MouseButtons.Left) return;
+            if (!monLive[idx]) return;   // 答えない画面は選ばせない
             int num = monNums[idx];
             if (num == curMon) return;
 
@@ -869,20 +938,24 @@ namespace Oscv
                 int bw2 = (W - pad - bx - gap * (scr.Length - 1)) / scr.Length;
                 monBtns = new Btn[scr.Length];
                 monNums = new int[scr.Length];
-                ToolTip tip = new ToolTip();
+                monLive = new bool[scr.Length];
+                monTipText = new string[scr.Length];
+                monTip = new ToolTip();
                 for (int i = 0; i < scr.Length; i++)
                 {
                     int idx = i;
                     monNums[i] = Ddc.NumOf(scr[i].DeviceName);
+                    monLive[i] = true;   // 触れないと分かるまでは押せるままにする
                     monBtns[i] = new Btn();
                     monBtns[i].Bounds = new Rectangle(bx + i * (bw2 + gap), y, bw2, Sc(24));
                     monBtns[i].Text = monNums[i].ToString(CultureInfo.InvariantCulture);
                     monBtns[i].Font = new Font(Font.FontFamily, 8.5f);
                     monBtns[i].Clicked += delegate(object s, MouseEventArgs e) { OnMonitor(idx, e); };
                     // 同じ型の板が 2 枚並ぶと番号だけでは分からないので、大きさも出す
-                    tip.SetToolTip(monBtns[i], "ディスプレイ " + monNums[i] + "  " +
+                    monTipText[i] = "ディスプレイ " + monNums[i] + "  " +
                         scr[i].Bounds.Width + " x " + scr[i].Bounds.Height +
-                        (scr[i].Primary ? " (メイン)" : ""));
+                        (scr[i].Primary ? " (メイン)" : "");
+                    monTip.SetToolTip(monBtns[i], monTipText[i]);
                     Controls.Add(monBtns[i]);
                 }
                 y += Sc(24) + Sc(12);
@@ -1143,6 +1216,7 @@ namespace Oscv
             SetStatus("busy");
             SetStatus(Ddc.Open(ProbeVcp, startMon) && ReadAll() ? "ok" : "err");
             SyncSelection();
+            ProbeDisplays(false);   // 実値を出した後で、残りの画面の生死を調べる
 
             int lastHeal = Environment.TickCount;
 
@@ -1177,6 +1251,9 @@ namespace Oscv
                         refreshWanted = false;
                         for (int i = 0; i < N; i++) touched[i] = false;
                         if (ReadAll()) SetStatus("ok");
+                        // 消えていた画面の電源が入ったかもしれない。前面に
+                        // 出したこの機会に見に行く (生きている画面は叩かない)
+                        ProbeDisplays(true);
                     }
                     else if (status == "err" && Environment.TickCount - lastHeal > 5000)
                     {
