@@ -16,7 +16,7 @@ namespace Oscv
     static class App
     {
         // 版番号はここが唯一の出どころ (build.ps1 が読む)。v1 から 1 ずつ上げる。
-        public const int Version = 6;
+        public const int Version = 7;
     }
 
     // ================= theme =================
@@ -600,12 +600,12 @@ namespace Oscv
         //   0x10 brightness   write 0-100, read 1:1
         //   0x12 contrast     write 0-100, read 1:1
         //   0xF9 black stab.  write 0-20,  read x5   <- vendor specific
-        static readonly Channel[] CH = new Channel[] {
+        internal static readonly Channel[] CH = new Channel[] {
             new Channel("明るさ",                 0x10, 0, 100, 1),
             new Channel("コントラスト",           0x12, 0, 100, 1),
             new Channel("ブラックスタビライザー", 0xF9, 0,  20, 5)
         };
-        const byte ProbeVcp = 0xF9;
+        internal const byte ProbeVcp = 0xF9;
 
         // 画面の生死判定に使う VCP。扱っている項目をそのまま使う。
         // どれにも答えない板は、電源が落ちているか DDC で触れない板なので選ばせない
@@ -618,7 +618,7 @@ namespace Oscv
             return b;
         }
 
-        const int N = 3;
+        internal const int N = 3;
         float S = 1f;
         Slider[] sl = new Slider[N];
         Label[] lblName = new Label[N];
@@ -665,7 +665,7 @@ namespace Oscv
 
         Cfg cfg;
         int[,] presetVals = new int[3, N];
-        static readonly string[] PresetNames = new string[] { "弱", "中", "強" };
+        internal static readonly string[] PresetNames = new string[] { "弱", "中", "強" };
 
         bool moving;
         Point moveOrigin;
@@ -1391,16 +1391,135 @@ namespace Oscv
         }
 
         [STAThread]
-        static void Main()
+        static int Main(string[] args)
         {
+            // 引数があれば窓は出さない。反映して終わる (Cli.Run 参照)
+            if (args.Length > 0) return Cli.Run(args);
+
             try { SetProcessDPIAware(); } catch { }
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             Application.Run(new MainForm());
+            return 0;
         }
 
         [DllImport("user32.dll")]
         static extern bool SetProcessDPIAware();
+    }
+
+    // ================= コマンドライン =================
+    // oscv.exe 1=弱 2=強
+    //
+    // 「画面番号=プリセット」の組を並べる。1 つでも指定があれば窓は出さず、
+    // その場でモニターに反映して終わる。ショートカットやホットキーに割り当てて、
+    // 2 台まとめて切り替えるための入口。
+    //
+    // プリセットの中身は GUI と同じ ini から読む (画面ごとの値があればそれを、
+    // 無ければ番号なしの値を使う)。ini には何も書き戻さない。
+    static class Cli
+    {
+        // 終了コード: 0 = 全部の組を反映できた / 1 = 反映できなかった組がある
+        public static int Run(string[] args)
+        {
+            List<int> nums = new List<int>();
+            List<int> presets = new List<int>();
+
+            foreach (string a in args)
+            {
+                if (a == "/?" || a == "-h" || a == "--help") { Usage(null); return 0; }
+                int num, p;
+                if (!Parse(a, out num, out p)) { Usage(a); return 1; }
+                nums.Add(num);
+                presets.Add(p);
+            }
+
+            Cfg cfg = Cfg.Load();
+            bool allOk = true;
+            for (int k = 0; k < nums.Count; k++)
+                if (!Apply(cfg, nums[k], presets[k])) allOk = false;
+
+            Ddc.Close();
+            return allOk ? 0 : 1;
+        }
+
+        // "2=強" -> num=2, p=2。プリセットは名前でも番号 (1..3) でもよい
+        static bool Parse(string arg, out int num, out int p)
+        {
+            num = -1;
+            p = -1;
+            if (arg == null) return false;
+            int eq = arg.IndexOf('=');
+            if (eq <= 0 || eq >= arg.Length - 1) return false;
+
+            string left = arg.Substring(0, eq).Trim();
+            string right = arg.Substring(eq + 1).Trim();
+
+            if (!int.TryParse(left, NumberStyles.Integer, CultureInfo.InvariantCulture, out num) ||
+                num < 1) return false;
+
+            for (int i = 0; i < MainForm.PresetNames.Length; i++)
+                if (right == MainForm.PresetNames[i]) { p = i; return true; }
+
+            int n;
+            if (int.TryParse(right, NumberStyles.Integer, CultureInfo.InvariantCulture, out n) &&
+                n >= 1 && n <= MainForm.PresetNames.Length) { p = n - 1; return true; }
+
+            return false;
+        }
+
+        static bool Apply(Cfg cfg, int num, int p)
+        {
+            Dbg.W("cli: display" + num + " <- " + MainForm.PresetNames[p]);
+
+            // 指定された画面が答えなければ、そこで終わり。
+            // 黙って別の板に書くことだけは避ける
+            if (!Ddc.Open(MainForm.ProbeVcp, num))
+            {
+                Dbg.W("cli:   display" + num + " が開けません");
+                return false;
+            }
+
+            cfg.Prefix = "m" + num.ToString(CultureInfo.InvariantCulture) + ".";
+
+            bool any = false;
+            for (int i = 0; i < MainForm.N; i++)
+            {
+                Channel c = MainForm.CH[i];
+                int v = cfg.Preset(p, i);
+                if (v < c.Min) v = c.Min;   // 範囲外は黙って無視されるので必ず丸める
+                if (v > c.Max) v = c.Max;
+
+                // 失敗したら 1 回だけ置いて出し直す。GUI が動いていると DDC が
+                // かち合うことがあるため。それでも駄目なら、その板に無い項目
+                // (LG 以外の 0xF9 など) とみなして次へ進む
+                bool ok = Ddc.Write(c.Vcp, v, MainForm.ProbeVcp);
+                if (!ok)
+                {
+                    Thread.Sleep(40);
+                    ok = Ddc.Write(c.Vcp, v, MainForm.ProbeVcp);
+                }
+                Dbg.W("cli:   vcp" + c.Vcp.ToString("X2") + " <- " + v + (ok ? "" : "  失敗"));
+                any |= ok;
+            }
+            return any;
+        }
+
+        // 窓なし exe なので、コンソールには何も出せない。
+        // 指定を間違えたときだけダイアログで知らせる
+        static void Usage(string bad)
+        {
+            string s =
+                "使い方:  oscv.exe <画面番号>=<プリセット> ...\r\n\r\n" +
+                "  例:  oscv.exe 1=弱 2=強\r\n\r\n" +
+                "  画面番号は Windows のディスプレイ番号。\r\n" +
+                "  プリセットは 弱 / 中 / 強 (1 / 2 / 3 でも可)。\r\n" +
+                "  組はいくつでも並べられ、書いた順に反映します。\r\n\r\n" +
+                "  指定を付けずに実行すると、いつもの窓が開きます。\r\n" +
+                "  終了コード 0 = 全部反映、1 = 反映できなかった画面がある。";
+            if (bad != null) s = "解釈できない指定: " + bad + "\r\n\r\n" + s;
+            MessageBox.Show(s, "oscv v" + App.Version.ToString(CultureInfo.InvariantCulture),
+                            MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
     }
 
     // ================= tiny ini =================
