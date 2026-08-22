@@ -16,7 +16,7 @@ namespace Oscv
     static class App
     {
         // 版番号はここが唯一の出どころ (build.ps1 が読む)。v1 から 1 ずつ上げる。
-        public const int Version = 5;
+        public const int Version = 6;
     }
 
     // ================= theme =================
@@ -628,7 +628,13 @@ namespace Oscv
         int[] monNums = new int[0];   // 上のボタンに対応する Windows の画面番号
         bool[] monLive = new bool[0]; // DDC に答えるか。答えない画面は非活性にする
         string[] monTipText = new string[0];
-        ToolTip monTip;
+        ToolTip tip;                  // 画面ボタンと「起動時」で共用
+
+        // その画面を最初に読んだときの値。触ったあとに戻すためのもの。
+        // ini には残さない (起動し直せば、その時点の実値がまた入るため)
+        Btn bootBtn;
+        int[] boot = new int[N];
+        volatile bool[] bootGot = new bool[N];
         Panel header;
         Label title;
         Btn closeBtn;
@@ -792,7 +798,7 @@ namespace Oscv
             monLive[i] = live;
             monBtns[i].Enabled = live;
             monBtns[i].Invalidate();
-            monTip.SetToolTip(monBtns[i], monTipText[i] + (live ? "" : "  応答なし"));
+            tip.SetToolTip(monBtns[i], monTipText[i] + (live ? "" : "  応答なし"));
         }
 
         // ワーカーから。onlyDead なら、いま死んでいる画面だけ見に行く
@@ -844,6 +850,9 @@ namespace Oscv
                 lblVal[i].Text = v.ToString(CultureInfo.InvariantCulture);
                 lock (gate) target[i] = v;
             }
+
+            bootBtn.Enabled = false;   // 切り替え先の値を読むまでは戻り先が無い
+            bootBtn.Invalidate();
 
             SetStatus("busy");
             wantMon = num;
@@ -918,6 +927,7 @@ namespace Oscv
             closeBtn.Clicked += delegate { Close(); };
             header.Controls.Add(closeBtn);
 
+            tip = new ToolTip();
             int y = hh + Sc(10);
 
             // 画面が 2 つ以上あるときだけ切り替えの列を出す。1 つなら v3 までと同じ窓
@@ -940,7 +950,6 @@ namespace Oscv
                 monNums = new int[scr.Length];
                 monLive = new bool[scr.Length];
                 monTipText = new string[scr.Length];
-                monTip = new ToolTip();
                 for (int i = 0; i < scr.Length; i++)
                 {
                     int idx = i;
@@ -955,7 +964,7 @@ namespace Oscv
                     monTipText[i] = "ディスプレイ " + monNums[i] + "  " +
                         scr[i].Bounds.Width + " x " + scr[i].Bounds.Height +
                         (scr[i].Primary ? " (メイン)" : "");
-                    monTip.SetToolTip(monBtns[i], monTipText[i]);
+                    tip.SetToolTip(monBtns[i], monTipText[i]);
                     Controls.Add(monBtns[i]);
                 }
                 y += Sc(24) + Sc(12);
@@ -998,17 +1007,30 @@ namespace Oscv
             }
 
             y += Sc(2);
-            int bw = (W - pad * 2 - Sc(12)) / 3;
+            // 弱 / 中 / 強 と「起動時」で 4 つ。1 行に収める
+            int gapp = Sc(6);
+            int bw = (W - pad * 2 - gapp * 3) / 4;
             for (int i = 0; i < 3; i++)
             {
                 int idx = i;
                 presets[i] = new Btn();
-                presets[i].Bounds = new Rectangle(pad + i * (bw + Sc(6)), y, bw, Sc(24));
+                presets[i].Bounds = new Rectangle(pad + i * (bw + gapp), y, bw, Sc(24));
                 presets[i].Text = PresetNames[i];
                 presets[i].Font = new Font(Font.FontFamily, 8.5f);
                 presets[i].Clicked += delegate(object s, MouseEventArgs e) { OnPreset(idx, e); };
                 Controls.Add(presets[i]);
             }
+
+            // 起動時の値に戻すボタン。値は自動で入るので、右クリックの保存は無い。
+            // 読めるまでは押せない
+            bootBtn = new Btn();
+            bootBtn.Bounds = new Rectangle(pad + 3 * (bw + gapp), y, bw, Sc(24));
+            bootBtn.Text = "起動時";
+            bootBtn.Font = new Font(Font.FontFamily, 8f);
+            bootBtn.Enabled = false;
+            bootBtn.Clicked += OnBoot;
+            Controls.Add(bootBtn);
+            tip.SetToolTip(bootBtn, "この画面を開いたときの値に戻す");
             y += Sc(24) + Sc(13);
 
             ClientSize = new Size(W, y);
@@ -1110,6 +1132,39 @@ namespace Oscv
             signal.Set();
         }
 
+        // 起動時の値に戻す。押せるのは 1 つでも値を掴めているときだけ
+        void OnBoot(object s, MouseEventArgs e)
+        {
+            if (e.Button != MouseButtons.Left) return;   // 自動保存なので右クリックは無し
+
+            for (int i = 0; i < N; i++)
+            {
+                if (!avail[i] || !bootGot[i]) continue;
+                sl[i].Value = boot[i];
+                touched[i] = true;
+                lblVal[i].Text = sl[i].Value.ToString(CultureInfo.InvariantCulture);
+                Commit(i);
+            }
+            bootBtn.Flash = 3;
+            bootBtn.Invalidate();
+        }
+
+        // ワーカーが最初の実値を掴んだところで押せるようにする
+        void SetBootReady()
+        {
+            StringBuilder sb = new StringBuilder("この画面を開いたときの値に戻す");
+            bool any = false;
+            for (int i = 0; i < N; i++)
+            {
+                if (!bootGot[i]) continue;
+                sb.Append(any ? " / " : "  ").Append(boot[i].ToString(CultureInfo.InvariantCulture));
+                any = true;
+            }
+            bootBtn.Enabled = any;
+            bootBtn.Invalidate();
+            tip.SetToolTip(bootBtn, sb.ToString());
+        }
+
         void OnPreset(int p, MouseEventArgs e)
         {
             if (e.Button == MouseButtons.Right)
@@ -1139,6 +1194,7 @@ namespace Oscv
         {
             for (int i = 0; i < 3; i++)
                 if (presets[i].Flash > 0) { presets[i].Flash--; presets[i].Invalidate(); }
+            if (bootBtn.Flash > 0) { bootBtn.Flash--; bootBtn.Invalidate(); }
         }
 
         void SetStatus(string st)
@@ -1152,6 +1208,7 @@ namespace Oscv
         bool ReadAll()
         {
             bool healthy = false;
+            bool gotBoot = false;
             for (int i = 0; i < N; i++)
             {
                 if (HasPending()) return true;   // user is driving; their value wins
@@ -1178,6 +1235,16 @@ namespace Oscv
                     applied[idx] = vv;
                     if (!touched[idx]) target[idx] = vv;
                 }
+
+                // 「起動時」= その画面で最初に読めた値。読めた順に 1 項目ずつ
+                // 押さえるので、途中で操作されても掴んだぶんは正しい
+                if (!bootGot[idx])
+                {
+                    boot[idx] = vv;
+                    bootGot[idx] = true;
+                    gotBoot = true;
+                }
+
                 try
                 {
                     BeginInvoke((MethodInvoker)delegate
@@ -1189,6 +1256,8 @@ namespace Oscv
                 }
                 catch { }
             }
+            if (gotBoot)
+                try { BeginInvoke((MethodInvoker)delegate { SetBootReady(); }); } catch { }
             return healthy;
         }
 
@@ -1243,7 +1312,10 @@ namespace Oscv
                         // 画面の切り替え。掴み直して、その板の実値を読み直す
                         wantMon = NoSwitch;
                         SetStatus("busy");
-                        for (int i = 0; i < N; i++) { touched[i] = false; avail[i] = true; }
+                        // 「起動時」は画面ごとに持ち直す。切り替えた先の板を
+                        // 最初に読んだ値が、その板の戻り先になる
+                        for (int i = 0; i < N; i++)
+                        { touched[i] = false; avail[i] = true; bootGot[i] = false; }
                         SetStatus(Ddc.Open(ProbeVcp, mw) && ReadAll() ? "ok" : "err");
                     }
                     else if (refreshWanted)
