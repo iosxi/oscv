@@ -16,7 +16,7 @@ namespace Oscv
     static class App
     {
         // 版番号はここが唯一の出どころ (build.ps1 が読む)。v1 から 1 ずつ上げる。
-        public const int Version = 7;
+        public const int Version = 8;
     }
 
     // ================= theme =================
@@ -202,6 +202,12 @@ namespace Oscv
                 Dbg.W("  display" + num + " does not answer");
                 return false;
             }
+        }
+
+        // 1 回だけ読む。リトライも開き直しもしない (書いた値が入ったかの確認用)
+        public static int Peek(byte code)
+        {
+            lock (gate) { return opened ? Raw(target, code) : -1; }
         }
 
         // A single read costs ~60ms and fails outright maybe 1 time in 40.
@@ -720,6 +726,13 @@ namespace Oscv
             flashTimer.Start();
 
             Application.AddMessageFilter(this);
+
+            // ワーカーからの BeginInvoke は、窓のハンドルが出来ていないと例外になる。
+            // ハンドルが出来るのは Application.Run の中なので、起動直後の 1 回目
+            // (実値の表示・掴んだ画面番号の確定・「起動時」の有効化) が丸ごと
+            // 捨てられていた。ワーカーを起こす前にハンドルを作っておく
+            IntPtr hwnd = Handle;
+            Dbg.W("form handle=" + hwnd.ToInt64());
 
             worker = new Thread(WorkerLoop);
             worker.IsBackground = false;
@@ -1323,6 +1336,7 @@ namespace Oscv
                         refreshWanted = false;
                         for (int i = 0; i < N; i++) touched[i] = false;
                         if (ReadAll()) SetStatus("ok");
+                        SyncSelection();   // 起動直後に取りこぼしていたら、ここで揃える
                         // 消えていた画面の電源が入ったかもしれない。前面に
                         // 出したこの機会に見に行く (生きている画面は叩かない)
                         ProbeDisplays(true);
@@ -1472,11 +1486,17 @@ namespace Oscv
             Dbg.W("cli: display" + num + " <- " + MainForm.PresetNames[p]);
 
             // 指定された画面が答えなければ、そこで終わり。
-            // 黙って別の板に書くことだけは避ける
+            // 黙って別の板に書くことだけは避ける。
+            // ただし直前に別プロセスが DDC を叩いていると最初の一撃が空振りする
+            // ことがあるので、一度だけ置いて出し直す (GUI と違って一発勝負なので)
             if (!Ddc.Open(MainForm.ProbeVcp, num))
             {
-                Dbg.W("cli:   display" + num + " が開けません");
-                return false;
+                Thread.Sleep(120);
+                if (!Ddc.Open(MainForm.ProbeVcp, num))
+                {
+                    Dbg.W("cli:   display" + num + " が開けません");
+                    return false;
+                }
             }
 
             cfg.Prefix = "m" + num.ToString(CultureInfo.InvariantCulture) + ".";
@@ -1489,19 +1509,27 @@ namespace Oscv
                 if (v < c.Min) v = c.Min;   // 範囲外は黙って無視されるので必ず丸める
                 if (v > c.Max) v = c.Max;
 
-                // 失敗したら 1 回だけ置いて出し直す。GUI が動いていると DDC が
-                // かち合うことがあるため。それでも駄目なら、その板に無い項目
-                // (LG 以外の 0xF9 など) とみなして次へ進む
-                bool ok = Ddc.Write(c.Vcp, v, MainForm.ProbeVcp);
-                if (!ok)
-                {
-                    Thread.Sleep(40);
-                    ok = Ddc.Write(c.Vcp, v, MainForm.ProbeVcp);
-                }
+                bool ok = WriteVerified(c, v);
                 Dbg.W("cli:   vcp" + c.Vcp.ToString("X2") + " <- " + v + (ok ? "" : "  失敗"));
                 any |= ok;
             }
             return any;
+        }
+
+        // 「書けた」と言われても板が黙って無視することがある (SetVCPFeature は
+        // 範囲外でも true を返すし、DDC 自体たまに取りこぼす)。窓を出さない分だけ
+        // 結果が目に見えないので、読み返して確かめ、違っていたら一度だけ書き直す。
+        // その板に無い項目 (LG 以外の 0xF9 など) はここで false になって次へ進む
+        static bool WriteVerified(Channel c, int v)
+        {
+            for (int attempt = 0; attempt < 2; attempt++)
+            {
+                Ddc.Write(c.Vcp, v, MainForm.ProbeVcp);
+                Thread.Sleep(40);   // DDC は続けざまの往復に弱い。少し置いてから読む
+                int raw = Ddc.Peek(c.Vcp);
+                if (raw >= 0 && (int)Math.Round((double)raw / c.GetDiv) == v) return true;
+            }
+            return false;
         }
 
         // 窓なし exe なので、コンソールには何も出せない。
@@ -1583,12 +1611,13 @@ namespace Oscv
             return int.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out v) ? v : def;
         }
 
-        // 画面ごとの値。まだ無ければ番号なしの旧キーを引き継ぐ。
-        // 2 台目を挿した日に、1 台目で育てたプリセットがそのまま出発点になる
+        // 画面ごとの値。**番号なしのキーへは落とさない。**
+        // 落とすと 1 台目で保存した値が 2 台目の出発点になり、板ごとに分けている
+        // 意味がなくなる (2 台目の適正値は 1 台目とは違う)。
+        // まだ持っていない画面は、素の初期値から始める
         int GetPer(string k, int def)
         {
-            if (Prefix.Length > 0 && d.ContainsKey(Prefix + k)) return GetI(Prefix + k, def);
-            return GetI(k, def);
+            return GetI(Prefix + k, def);
         }
 
         void SetPer(string k, int v)
