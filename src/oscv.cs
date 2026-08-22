@@ -16,7 +16,7 @@ namespace Oscv
     static class App
     {
         // 版番号はここが唯一の出どころ (build.ps1 が読む)。v1 から 1 ずつ上げる。
-        public const int Version = 9;
+        public const int Version = 10;
     }
 
     // ================= theme =================
@@ -641,8 +641,6 @@ namespace Oscv
                 caption.Paint += CaptionPaint;
                 // 見出しの余白でも窓を動かせる (ヘッダーが遠い列があるため)
                 caption.MouseDown += form.HeaderDown;
-                caption.MouseMove += form.HeaderMove;
-                caption.MouseUp += form.HeaderUp;
                 Root.Controls.Add(caption);
                 y += Sc(19) + Sc(3);
             }
@@ -1031,8 +1029,6 @@ namespace Oscv
         Thread worker;
 
         Cfg cfg;
-        bool moving;
-        Point moveOrigin;
 
         public MainForm()
         {
@@ -1139,8 +1135,6 @@ namespace Oscv
             header.BackColor = T.Header;
             header.Bounds = new Rectangle(0, 0, totalW, hh);
             header.MouseDown += HeaderDown;
-            header.MouseMove += HeaderMove;
-            header.MouseUp += HeaderUp;
             header.Paint += HeaderPaint;
             Controls.Add(header);
 
@@ -1153,8 +1147,6 @@ namespace Oscv
             title.Text = "oscv v" + App.Version.ToString(CultureInfo.InvariantCulture);
             title.Font = new Font(Font.FontFamily, 8.5f, FontStyle.Bold);
             title.MouseDown += HeaderDown;
-            title.MouseMove += HeaderMove;
-            title.MouseUp += HeaderUp;
             header.Controls.Add(title);
 
             pinBtn = new PinBtn();
@@ -1190,7 +1182,10 @@ namespace Oscv
                 line.BringToFront();
             }
 
-            ClientSize = new Size(totalW, hh + colH);
+            // WM_NCCALCSIZE で非クライアント領域を 0 にしてあるので、
+            // クライアント領域 = ウィンドウの大きさ。ClientSize から逆算させると
+            // 付けたスタイルぶん (キャプションの高さ) だけ大きくなってしまう
+            Size = new Size(totalW, hh + colH);
         }
 
         // 列が 1 つのときだけヘッダーに状態ランプを出す (2 つ以上なら列の見出しに出る)
@@ -1233,22 +1228,64 @@ namespace Oscv
         }
 
         // ---------- window dragging ----------
+        // 移動は OS の移動ループに任せる。自分で Location を書き換えると
+        // WM_ENTERSIZEMOVE も EVENT_SYSTEM_MOVESIZESTART も飛ばないので、
+        // 「ウィンドウが動き始めたこと」を見ている常駐ソフト (スナップ系など) が
+        // ドラッグに気付けない。掴んだ場所をキャプション扱いで OS へ渡せば、
+        // 見た目はそのままで標準の移動になる
         public void HeaderDown(object s, MouseEventArgs e)
         {
             if (e.Button != MouseButtons.Left) return;
-            moving = true;
-            moveOrigin = Cursor.Position;
-            moveOrigin.Offset(-Location.X, -Location.Y);
+            ReleaseCapture();
+            SendMessage(Handle, WM_NCLBUTTONDOWN, (IntPtr)HTCAPTION, IntPtr.Zero);
         }
 
-        public void HeaderMove(object s, MouseEventArgs e)
+        // ---------- 枠なしのまま「普通のウィンドウ」にする ----------
+        // 見た目のために枠を消すと、Windows から見て普通のウィンドウでなくなる。
+        // タスクバーのボタンで最小化できない、スナップ系の常駐ソフトが吸着先として
+        // 拾ってくれない、といった不都合が出る (どれも WS_CAPTION / WS_MINIMIZEBOX /
+        // WS_SYSMENU の有無で判断されるため)。
+        //
+        // そこで**スタイルは普通のウィンドウと同じにして、WM_NCCALCSIZE で
+        // 非クライアント領域を 0 にする**。タイトルバーも枠も描かれないので
+        // 見た目は枠なしのまま、扱いだけ普通のウィンドウになる。
+        // 最大化だけは外してある (250px 幅の道具を全画面にしても困るだけで、
+        // WS_MAXIMIZEBOX を残すと上端ドラッグの Aero Snap で最大化してしまう)。
+        const int WS_CAPTION     = 0x00C00000;
+        const int WS_MAXIMIZEBOX = 0x00010000;
+        const int WS_SYSMENU     = 0x00080000;
+        const int WS_MINIMIZEBOX = 0x00020000;
+        const int WM_NCCALCSIZE  = 0x0083;
+
+        protected override CreateParams CreateParams
         {
-            if (!moving) return;
-            Point p = Cursor.Position;
-            Location = new Point(p.X - moveOrigin.X, p.Y - moveOrigin.Y);
+            get
+            {
+                CreateParams cp = base.CreateParams;
+                cp.Style |= WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+                // MaximizeBox = false だけでは枠なしのとき消えなかった (実測) ので、
+                // ここで確実に落とす。残っていると上端ドラッグの Aero Snap で
+                // 250px 幅の窓が全画面になってしまう
+                cp.Style &= ~WS_MAXIMIZEBOX;
+                return cp;
+            }
         }
 
-        public void HeaderUp(object s, MouseEventArgs e) { moving = false; }
+        protected override void WndProc(ref Message m)
+        {
+            // 0 を返す = クライアント領域がウィンドウ全体。非クライアント領域が
+            // 残らないので、キャプションも枠も描かれない
+            if (m.Msg == WM_NCCALCSIZE && m.WParam != IntPtr.Zero) { m.Result = IntPtr.Zero; return; }
+            base.WndProc(ref m);
+        }
+
+        [DllImport("user32.dll")]
+        static extern bool ReleaseCapture();
+        [DllImport("user32.dll")]
+        static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+
+        const int WM_NCLBUTTONDOWN = 0x00A1;
+        const int HTCAPTION = 2;
 
         // ---------- wheel routing: hover is enough, no click required ----------
         const int WM_MOUSEWHEEL = 0x020A;
