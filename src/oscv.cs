@@ -16,7 +16,7 @@ namespace Oscv
     static class App
     {
         // 版番号はここが唯一の出どころ (build.ps1 が読む)。v1 から 1 ずつ上げる。
-        public const int Version = 8;
+        public const int Version = 9;
     }
 
     // ================= theme =================
@@ -36,8 +36,6 @@ namespace Oscv
         public static Color TextDim = Color.FromArgb(124, 132, 144);
         public static Color BtnBg   = Color.FromArgb(44, 48, 54);
         public static Color BtnHot  = Color.FromArgb(64, 70, 79);
-        // 選ばれている画面のボタン。押し込まれた状態が一目で分かる程度の青
-        public static Color BtnSel  = Color.FromArgb(46, 90, 145);
         // その画面が対応していない項目 (スライダーを沈める色)
         public static Color Off     = Color.FromArgb(40, 43, 48);
         public static Color OffKnob = Color.FromArgb(78, 84, 93);
@@ -158,15 +156,23 @@ namespace Oscv
         static List<IntPtr> bufs = new List<IntPtr>();      // native PHYSICAL_MONITOR[] we must destroy
         static List<uint> bufCounts = new List<uint>();
         static List<Phys> phys = new List<Phys>();
-        static IntPtr target = IntPtr.Zero;
-        // 0 is a legitimate physical-monitor handle, so openness needs its own flag.
-        static bool opened;
-        static int curNum = -1;    // いま掴んでいる画面番号
-        static int wantNum = -1;   // 選ばれている画面番号 (-1 = おまかせ)
         static readonly object gate = new object();
 
-        public static bool IsOpen { get { return opened; } }
-        public static int CurrentNum { get { return curNum; } }
+        // 掴んでいる板は全部つかんだまま持つ。呼ぶ側は画面番号で指す。
+        // ハンドルを外に出さないのは、0 が正当なハンドルで「未設定」と
+        // 区別できないため (IndexOf は見つからないとき -1 を返す)
+        public static bool IsOpen { get { lock (gate) { return phys.Count > 0; } } }
+
+        public static bool Has(int num)
+        {
+            lock (gate) { return IndexOf(num) >= 0; }
+        }
+
+        static int IndexOf(int num)
+        {
+            for (int i = 0; i < phys.Count; i++) if (phys[i].Num == num) return i;
+            return -1;
+        }
 
         // "\\.\DISPLAY2" -> 2。取れなければ -1
         public static int NumOf(string device)
@@ -205,9 +211,13 @@ namespace Oscv
         }
 
         // 1 回だけ読む。リトライも開き直しもしない (書いた値が入ったかの確認用)
-        public static int Peek(byte code)
+        public static int Peek(int num, byte code)
         {
-            lock (gate) { return opened ? Raw(target, code) : -1; }
+            lock (gate)
+            {
+                int idx = IndexOf(num);
+                return idx >= 0 ? Raw(phys[idx].Handle, code) : -1;
+            }
         }
 
         // A single read costs ~60ms and fails outright maybe 1 time in 40.
@@ -218,25 +228,14 @@ namespace Oscv
             return (int)cur;
         }
 
-        // want = 操作したい画面番号。-1 なら、ベンダー固有コードに答える板 (= LG) を選ぶ。
-        // 番号を指定したのにその画面が答えないときは、黙って別の画面を掴まない。
-        // 掴んだら、指定と違う板をいじってしまうより赤ランプの方がましなので失敗させる。
-        public static bool Open(byte probeVcp, int want)
+        // つながっている画面を全部開く。開き直し (寝起き・抜き差し・一時的な
+        // 失敗からの復帰) も同じ入口。どれを操作するかは呼ぶ側が番号で決める
+        public static bool Open()
         {
-            lock (gate)
-            {
-                wantNum = want;
-                return OpenLocked(probeVcp);
-            }
+            lock (gate) { return OpenLocked(); }
         }
 
-        // いま選ばれている画面のまま開き直す (寝起き・抜き差し・一時的な失敗から復帰する)
-        public static bool Reopen(byte probeVcp)
-        {
-            lock (gate) { return OpenLocked(probeVcp); }
-        }
-
-        static bool OpenLocked(byte probeVcp)
+        static bool OpenLocked()
         {
             CloseLocked();
 
@@ -245,7 +244,7 @@ namespace Oscv
             { hmons.Add(hm); return true; };
             EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, cb, IntPtr.Zero);
 
-            Dbg.W("Open: hmon=" + hmons.Count + " want=" + wantNum);
+            Dbg.W("Open: hmon=" + hmons.Count);
             if (hmons.Count == 0) return false;
 
             // 画面ごとに物理モニターを開く。1 台目で止めない (v3 まではここで
@@ -286,39 +285,11 @@ namespace Oscv
                 }
             }
             Dbg.W("Open: physical=" + phys.Count);
-            if (phys.Count == 0) return false;
-
-            // 指定が無ければ、ベンダー固有コードに答える板を優先する。
-            // 2 台つないだ机では、それが LG の方になる
-            for (int pass = 0; pass < 2; pass++)
-            {
-                byte code = pass == 0 ? probeVcp : (byte)0x10;
-                for (int i = 0; i < phys.Count; i++)
-                {
-                    if (wantNum >= 0 && phys[i].Num != wantNum) continue;
-                    int v = Raw(phys[i].Handle, code);
-                    Dbg.W("  probe display" + phys[i].Num + " h=" + phys[i].Handle.ToInt64() +
-                          " vcp" + code.ToString("X2") + " -> " + v +
-                          (v < 0 ? " err=" + Marshal.GetLastWin32Error() : ""));
-                    if (v >= 0)
-                    {
-                        target = phys[i].Handle;
-                        curNum = phys[i].Num;
-                        opened = true;
-                        return true;
-                    }
-                }
-            }
-
-            Dbg.W("Open: FAILED");
-            return false;
+            return phys.Count > 0;
         }
 
         static void CloseLocked()
         {
-            target = IntPtr.Zero;
-            opened = false;
-            curNum = -1;
             phys.Clear();
             for (int i = 0; i < bufs.Count; i++)
             {
@@ -333,37 +304,37 @@ namespace Oscv
 
         // Retries the transient failures, then re-acquires handles once in case
         // the display went to sleep / was replugged / changed resolution.
-        public static int Read(byte code, byte probeVcp)
+        public static int Read(int num, byte code)
         {
             lock (gate)
             {
-                for (int i = 0; opened && i < 4; i++)
+                int idx = IndexOf(num);
+                for (int i = 0; idx >= 0 && i < 4; i++)
                 {
-                    int v = Raw(target, code);
+                    int v = Raw(phys[idx].Handle, code);
                     if (v >= 0) return v;
                     Thread.Sleep(40);   // DDC needs a breather between transactions
                 }
-            }
-            Dbg.W("  Read(" + code.ToString("X2") + ") retries exhausted, reopening");
-            if (!Reopen(probeVcp)) return -1;
-            lock (gate)
-            {
-                return opened ? Raw(target, code) : -1;
+
+                Dbg.W("  Read(display" + num + " " + code.ToString("X2") + ") 開き直します");
+                if (!OpenLocked()) return -1;
+                idx = IndexOf(num);
+                return idx >= 0 ? Raw(phys[idx].Handle, code) : -1;
             }
         }
 
         // NOTE: SetVCPFeature returns true even when the monitor silently ignores
         // an out-of-range value, so callers must clamp before calling.
-        public static bool Write(byte code, int val, byte probeVcp)
+        public static bool Write(int num, byte code, int val)
         {
             lock (gate)
             {
-                if (opened && SetVCPFeature(target, code, (uint)val)) return true;
-            }
-            if (!Reopen(probeVcp)) return false;
-            lock (gate)
-            {
-                return opened && SetVCPFeature(target, code, (uint)val);
+                int idx = IndexOf(num);
+                if (idx >= 0 && SetVCPFeature(phys[idx].Handle, code, (uint)val)) return true;
+
+                if (!OpenLocked()) return false;
+                idx = IndexOf(num);
+                return idx >= 0 && SetVCPFeature(phys[idx].Handle, code, (uint)val);
             }
         }
     }
@@ -514,7 +485,6 @@ namespace Oscv
     {
         bool _hot;
         public int Flash;
-        public bool Selected;   // 画面切り替えボタンで、今いじっている画面を示す
         public event MouseEventHandler Clicked;
 
         public Btn()
@@ -539,7 +509,7 @@ namespace Oscv
             g.SmoothingMode = SmoothingMode.AntiAlias;
             g.Clear(Parent == null ? T.Bg : Parent.BackColor);
             Color bg = !Enabled ? T.Off
-                     : (Flash > 0 ? T.Fill : (_hot ? T.BtnHot : (Selected ? T.BtnSel : T.BtnBg)));
+                     : (Flash > 0 ? T.Fill : (_hot ? T.BtnHot : T.BtnBg));
             using (SolidBrush b = new SolidBrush(bg))
                 Gfx.Round(g, b, 0, 0, Width, Height, (int)Math.Round(Height * 0.45));
             DrawGlyph(g, !Enabled ? T.OffKnob : (Flash > 0 ? Color.White : T.Text));
@@ -600,6 +570,423 @@ namespace Oscv
     }
 
     // ================= main form =================
+    // ================= 1 画面ぶんの操作列 =================
+    // ディスプレイ 1 台ぶんの UI と状態。自分の画面番号だけを読み書きする。
+    // 画面が 2 つあれば、これが横に 2 つ並ぶ (タブで切り替えるのではなく、
+    // 両方を同じ窓の中で完結させる)。
+    class Column
+    {
+        public readonly int Num;          // Windows の画面番号
+        public readonly Panel Root;
+        public readonly int Height;
+
+        readonly MainForm form;
+        readonly Cfg cfg;
+        readonly float S;
+
+        Slider[] sl = new Slider[MainForm.N];
+        Label[] lblName = new Label[MainForm.N];
+        Label[] lblVal = new Label[MainForm.N];
+        Btn[] presets = new Btn[3];
+        Btn bootBtn;
+        Panel caption;                    // 見出し (画面が 2 つ以上のときだけ)
+        Font capFont;
+        int[,] presetVals = new int[3, MainForm.N];
+
+        // ワーカーと UI で共有する値。gate の中でだけ触る
+        readonly object gate = new object();
+        int[] target = new int[MainForm.N];
+        int[] applied = new int[MainForm.N];
+        bool[] dirty = new bool[MainForm.N];
+
+        volatile bool[] touched = new bool[MainForm.N];
+        volatile bool[] avail = new bool[MainForm.N];
+        volatile bool[] bootGot = new bool[MainForm.N];
+        int[] boot = new int[MainForm.N];
+
+        public volatile string Status = "init";
+        public volatile bool Live = true;   // DDC に答える画面か
+
+        int Sc(double v) { return (int)Math.Round(v * S); }
+
+        public Column(MainForm form, Cfg cfg, int num, float s, int w, bool showCaption)
+        {
+            this.form = form;
+            this.cfg = cfg;
+            this.Num = num;
+            this.S = s;
+
+            for (int i = 0; i < MainForm.N; i++) avail[i] = true;
+            for (int p = 0; p < 3; p++)
+                for (int i = 0; i < MainForm.N; i++) presetVals[p, i] = cfg.Preset(num, p, i);
+
+            Root = new Panel();
+            Root.BackColor = T.Bg;
+            Height = Build(w, showCaption);
+            Root.Size = new Size(w, Height);
+            Seed();
+        }
+
+        int Build(int w, bool showCaption)
+        {
+            int pad = Sc(15);
+            int y = Sc(10);
+
+            if (showCaption)
+            {
+                capFont = new Font(form.Font.FontFamily, 8.5f, FontStyle.Bold);
+                caption = new Panel();
+                caption.Bounds = new Rectangle(0, y, w, Sc(19));
+                caption.BackColor = T.Bg;
+                caption.Paint += CaptionPaint;
+                // 見出しの余白でも窓を動かせる (ヘッダーが遠い列があるため)
+                caption.MouseDown += form.HeaderDown;
+                caption.MouseMove += form.HeaderMove;
+                caption.MouseUp += form.HeaderUp;
+                Root.Controls.Add(caption);
+                y += Sc(19) + Sc(3);
+            }
+
+            for (int i = 0; i < MainForm.N; i++)
+            {
+                int idx = i;
+                Channel c = MainForm.CH[i];
+
+                lblName[i] = new Label();
+                lblName[i].AutoSize = false;
+                lblName[i].Bounds = new Rectangle(pad, y, w - pad * 2 - Sc(46), Sc(17));
+                lblName[i].ForeColor = T.Label;
+                lblName[i].Text = c.Label;
+                lblName[i].TextAlign = ContentAlignment.MiddleLeft;
+                lblName[i].Font = new Font(form.Font.FontFamily, 8.5f);
+                Root.Controls.Add(lblName[i]);
+
+                lblVal[i] = new Label();
+                lblVal[i].AutoSize = false;
+                lblVal[i].Bounds = new Rectangle(w - pad - Sc(46), y, Sc(46), Sc(17));
+                lblVal[i].ForeColor = T.Text;
+                lblVal[i].TextAlign = ContentAlignment.MiddleRight;
+                lblVal[i].Font = new Font(form.Font.FontFamily, 10.5f, FontStyle.Bold);
+                Root.Controls.Add(lblVal[i]);
+
+                y += Sc(18);
+
+                sl[i] = new Slider();
+                sl[i].S = S;
+                sl[i].Min = c.Min;
+                sl[i].Max = c.Max;
+                sl[i].BackColor = T.Bg;
+                sl[i].Bounds = new Rectangle(pad - Sc(3), y, w - (pad - Sc(3)) * 2, Sc(28));
+                sl[i].ValueChanged += delegate { OnSlide(idx); };
+                sl[i].ValueCommitted += delegate { Commit(idx); };
+                Root.Controls.Add(sl[i]);
+
+                y += Sc(28) + Sc(10);
+            }
+
+            // 弱 / 中 / 強 と「起動時」で 4 つ。1 列に収める
+            y += Sc(2);
+            int gap = Sc(6);
+            int bw = (w - pad * 2 - gap * 3) / 4;
+            for (int i = 0; i < 3; i++)
+            {
+                int idx = i;
+                presets[i] = new Btn();
+                presets[i].Bounds = new Rectangle(pad + i * (bw + gap), y, bw, Sc(24));
+                presets[i].Text = MainForm.PresetNames[i];
+                presets[i].Font = new Font(form.Font.FontFamily, 8.5f);
+                presets[i].Clicked += delegate(object s, MouseEventArgs e) { OnPreset(idx, e); };
+                Root.Controls.Add(presets[i]);
+            }
+
+            // 起動時の値に戻すボタン。値は自動で入るので、右クリックの保存は無い
+            bootBtn = new Btn();
+            bootBtn.Bounds = new Rectangle(pad + 3 * (bw + gap), y, bw, Sc(24));
+            bootBtn.Text = "起動時";
+            bootBtn.Font = new Font(form.Font.FontFamily, 8f);
+            bootBtn.Enabled = false;
+            bootBtn.Clicked += OnBoot;
+            Root.Controls.Add(bootBtn);
+
+            return y + Sc(24) + Sc(13);
+        }
+
+        void CaptionPaint(object sender, PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            int d = Sc(7), x = Sc(15), yy = (caption.Height - d) / 2;
+            using (SolidBrush b = new SolidBrush(MainForm.StatusColor(Status)))
+                g.FillEllipse(b, x, yy, d, d);
+
+            string s = "画面 " + Num.ToString(CultureInfo.InvariantCulture) + (Live ? "" : "  応答なし");
+            TextRenderer.DrawText(g, s, capFont,
+                new Rectangle(x + d + Sc(8), 0, caption.Width, caption.Height),
+                Live ? T.Label : T.TextDim,
+                TextFormatFlags.Left | TextFormatFlags.VerticalCenter);
+        }
+
+        // 種は ini の最終値。実値はワーカーが 200ms ほどで上書きする
+        void Seed()
+        {
+            for (int i = 0; i < MainForm.N; i++)
+            {
+                int v = cfg.Last(Num, i, MainForm.CH[i].Min, MainForm.CH[i].Max);
+                sl[i].SetValueSilent(v);
+                lblVal[i].Text = v.ToString(CultureInfo.InvariantCulture);
+                target[i] = v;
+                applied[i] = v;
+            }
+        }
+
+        public bool Owns(Slider s)
+        {
+            for (int i = 0; i < MainForm.N; i++) if (ReferenceEquals(sl[i], s)) return true;
+            return false;
+        }
+
+        // ---------- 操作 ----------
+
+        void OnSlide(int i)
+        {
+            touched[i] = true;
+            lblVal[i].Text = sl[i].Value.ToString(CultureInfo.InvariantCulture);
+            Commit(i);
+        }
+
+        void Commit(int i)
+        {
+            int v = sl[i].Value;
+            lock (gate)
+            {
+                if (target[i] == v && !dirty[i]) return;
+                target[i] = v;
+                dirty[i] = true;
+            }
+            form.Wake();
+        }
+
+        void OnPreset(int p, MouseEventArgs e)
+        {
+            if (e.Button == MouseButtons.Right)
+            {
+                // 沈んでいる項目はこの画面に無い。前の値をそのまま残す
+                for (int i = 0; i < MainForm.N; i++) if (avail[i]) presetVals[p, i] = sl[i].Value;
+                cfg.SavePreset(Num, p, presetVals);
+                presets[p].Flash = 5;
+                presets[p].Invalidate();
+                return;
+            }
+            if (e.Button != MouseButtons.Left) return;
+
+            for (int i = 0; i < MainForm.N; i++)
+            {
+                if (!avail[i]) continue;
+                sl[i].Value = presetVals[p, i];
+                touched[i] = true;
+                lblVal[i].Text = sl[i].Value.ToString(CultureInfo.InvariantCulture);
+                Commit(i);
+            }
+            presets[p].Flash = 3;
+            presets[p].Invalidate();
+        }
+
+        // 起動時の値に戻す。押せるのは 1 つでも値を掴めているときだけ
+        void OnBoot(object sender, MouseEventArgs e)
+        {
+            if (e.Button != MouseButtons.Left) return;   // 自動保存なので右クリックは無し
+
+            for (int i = 0; i < MainForm.N; i++)
+            {
+                if (!avail[i] || !bootGot[i]) continue;
+                sl[i].Value = boot[i];
+                touched[i] = true;
+                lblVal[i].Text = sl[i].Value.ToString(CultureInfo.InvariantCulture);
+                Commit(i);
+            }
+            bootBtn.Flash = 3;
+            bootBtn.Invalidate();
+        }
+
+        public void Tick()
+        {
+            for (int i = 0; i < 3; i++)
+                if (presets[i].Flash > 0) { presets[i].Flash--; presets[i].Invalidate(); }
+            if (bootBtn.Flash > 0) { bootBtn.Flash--; bootBtn.Invalidate(); }
+        }
+
+        public void SaveLast()
+        {
+            for (int i = 0; i < MainForm.N; i++)
+                if (avail[i]) cfg.SetLast(Num, i, sl[i].Value);
+        }
+
+        // ---------- 見た目の状態 (UI スレッド) ----------
+
+        // 対応していない項目は沈めて触れなくする。書けば必ず失敗するので、
+        // 赤ランプを出し続けるよりこの方が正しい
+        void SetAvail(int i, bool on)
+        {
+            avail[i] = on;
+            lblName[i].ForeColor = on && Live ? T.Label : T.TextDim;
+            lblVal[i].ForeColor = on && Live ? T.Text : T.TextDim;
+            if (!on) lblVal[i].Text = "―";
+            sl[i].Enabled = on && Live;
+            sl[i].Invalidate();
+        }
+
+        // 画面ごと答えないときは列を丸ごと沈める
+        public void SetLive(bool live)
+        {
+            if (Live == live) return;
+            Live = live;
+            for (int i = 0; i < MainForm.N; i++) SetAvail(i, avail[i]);
+            for (int i = 0; i < 3; i++) { presets[i].Enabled = live; presets[i].Invalidate(); }
+            bootBtn.Enabled = live && AnyBoot();
+            bootBtn.Invalidate();
+            if (caption != null) caption.Invalidate();
+        }
+
+        bool AnyBoot()
+        {
+            for (int i = 0; i < MainForm.N; i++) if (bootGot[i]) return true;
+            return false;
+        }
+
+        // ワーカーが最初の実値を掴んだところで押せるようにする
+        void SetBootReady()
+        {
+            StringBuilder sb = new StringBuilder("この画面を開いたときの値に戻す");
+            bool any = false;
+            for (int i = 0; i < MainForm.N; i++)
+            {
+                if (!bootGot[i]) continue;
+                sb.Append(any ? " / " : "  ").Append(boot[i].ToString(CultureInfo.InvariantCulture));
+                any = true;
+            }
+            bootBtn.Enabled = any && Live;
+            bootBtn.Invalidate();
+            form.Tip.SetToolTip(bootBtn, sb.ToString());
+        }
+
+        public void SetStatus(string st)
+        {
+            if (Status == st) return;
+            Status = st;
+            form.Post(delegate
+            {
+                if (caption != null) caption.Invalidate();
+                else form.InvalidateHeader();
+            });
+        }
+
+        // ---------- ワーカーから ----------
+
+        public bool NextPending(out int ch, out int val)
+        {
+            lock (gate)
+            {
+                for (int i = 0; i < MainForm.N; i++)
+                {
+                    if (!dirty[i]) continue;
+                    if (target[i] != applied[i]) { ch = i; val = target[i]; return true; }
+                    dirty[i] = false;
+                }
+            }
+            ch = -1;
+            val = 0;
+            return false;
+        }
+
+        public void AfterWrite(int ch, int val, bool ok)
+        {
+            lock (gate)
+            {
+                if (ok) applied[ch] = val;
+                if (target[ch] == val) dirty[ch] = false;
+            }
+        }
+
+        public bool HasPending()
+        {
+            lock (gate)
+            {
+                for (int i = 0; i < MainForm.N; i++) if (dirty[i]) return true;
+            }
+            return false;
+        }
+
+        public void ForgetTouched()
+        {
+            for (int i = 0; i < MainForm.N; i++) touched[i] = false;
+        }
+
+        // この画面の実値を読み直す。ワーカースレッドから呼ぶ
+        public bool ReadAll()
+        {
+            bool healthy = false;
+            bool gotBoot = false;
+
+            for (int i = 0; i < MainForm.N; i++)
+            {
+                if (form.AnyPending()) return true;   // 操作中の値が優先
+                if (!avail[i]) continue;              // この画面には無い項目
+
+                Channel c = MainForm.CH[i];
+                int raw = Ddc.Read(Num, c.Vcp);
+                Dbg.W("read display" + Num + " " + c.Label + " vcp" + c.Vcp.ToString("X2") + " -> " + raw);
+                if (raw < 0)
+                {
+                    // 他の項目が読めているなら線は生きている。この項目だけが
+                    // 無い板ということなので、沈めて触れなくする
+                    if (healthy) MarkMissing(i);
+                    continue;
+                }
+                healthy = true;
+
+                int v = (int)Math.Round((double)raw / c.GetDiv);
+                if (v < c.Min) v = c.Min;
+                if (v > c.Max) v = c.Max;
+
+                int idx = i, vv = v;
+                lock (gate)
+                {
+                    applied[idx] = vv;
+                    if (!touched[idx]) target[idx] = vv;
+                }
+
+                // 「起動時」= その画面で最初に読めた値。読めた順に 1 項目ずつ
+                // 押さえるので、途中で操作されても掴んだぶんは正しい
+                if (!bootGot[idx])
+                {
+                    boot[idx] = vv;
+                    bootGot[idx] = true;
+                    gotBoot = true;
+                }
+
+                form.Post(delegate
+                {
+                    if (touched[idx]) return;
+                    sl[idx].SetValueSilent(vv);
+                    lblVal[idx].Text = vv.ToString(CultureInfo.InvariantCulture);
+                });
+            }
+
+            if (gotBoot) form.Post(delegate { SetBootReady(); });
+            return healthy;
+        }
+
+        // 判定はその場で持つ (次の ReadAll がまた 700ms かけて読みに行かないように)
+        void MarkMissing(int i)
+        {
+            if (!avail[i]) return;
+            avail[i] = false;
+            Dbg.W("  display" + Num + " has no vcp" + MainForm.CH[i].Vcp.ToString("X2"));
+            form.Post(delegate { SetAvail(i, false); });
+        }
+    }
+
+    // ================= main window =================
     class MainForm : Form, IMessageFilter
     {
         // Verified on this panel (LG UN700):
@@ -614,8 +1001,8 @@ namespace Oscv
         internal const byte ProbeVcp = 0xF9;
 
         // 画面の生死判定に使う VCP。扱っている項目をそのまま使う。
-        // どれにも答えない板は、電源が落ちているか DDC で触れない板なので選ばせない
-        static readonly byte[] ProbeCodes = MakeProbeCodes();
+        // どれにも答えない板は、電源が落ちているか DDC で触れない板
+        internal static readonly byte[] ProbeCodes = MakeProbeCodes();
 
         static byte[] MakeProbeCodes()
         {
@@ -625,68 +1012,31 @@ namespace Oscv
         }
 
         internal const int N = 3;
-        float S = 1f;
-        Slider[] sl = new Slider[N];
-        Label[] lblName = new Label[N];
-        Label[] lblVal = new Label[N];
-        Btn[] presets = new Btn[3];
-        Btn[] monBtns = new Btn[0];   // 画面の切り替え (画面が 2 つ以上あるときだけ出す)
-        int[] monNums = new int[0];   // 上のボタンに対応する Windows の画面番号
-        bool[] monLive = new bool[0]; // DDC に答えるか。答えない画面は非活性にする
-        string[] monTipText = new string[0];
-        ToolTip tip;                  // 画面ボタンと「起動時」で共用
+        internal static readonly string[] PresetNames = new string[] { "弱", "中", "強" };
+        internal const int ColW = 250;   // 1 列の幅 (論理px)
 
-        // その画面を最初に読んだときの値。触ったあとに戻すためのもの。
-        // ini には残さない (起動し直せば、その時点の実値がまた入るため)
-        Btn bootBtn;
-        int[] boot = new int[N];
-        volatile bool[] bootGot = new bool[N];
+        float S = 1f;
+        Column[] cols = new Column[0];
         Panel header;
         Label title;
         Btn closeBtn;
         PinBtn pinBtn;
         System.Windows.Forms.Timer flashTimer;
+        public ToolTip Tip;
 
-        volatile string status = "init";
         volatile bool alive = true;
         volatile bool refreshWanted;
-
-        // 画面の切り替え。UI は番号を置いてワーカーを起こすだけで、
-        // 開き直しと読み直しはワーカー側でやる (DDC は 1 回 60ms かかる)
-        const int NoSwitch = -2;
-        volatile int wantMon = NoSwitch;
-        int curMon = -1;                 // いま操作している画面番号 (-1 = おまかせ)
-        readonly int startMon;           // 起動時に開く画面。ワーカーが読む
-        // その画面が持っている項目か。持っていない例: LG 以外の板の 0xF9
-        volatile bool[] avail = new bool[N] { true, true, true };
-
-        readonly object gate = new object();
-        int[] target = new int[N];
-        int[] applied = new int[N];
-        bool[] dirty = new bool[N];
-        volatile bool[] touched = new bool[N];
+        volatile bool closing, workerDone;
         AutoResetEvent signal = new AutoResetEvent(false);
         Thread worker;
-        volatile bool closing, workerDone;
 
         Cfg cfg;
-        int[,] presetVals = new int[3, N];
-        internal static readonly string[] PresetNames = new string[] { "弱", "中", "強" };
-
         bool moving;
         Point moveOrigin;
 
         public MainForm()
         {
             cfg = Cfg.Load();
-
-            // 前回いじっていた画面を引き継ぐ。抜かれていたら、おまかせに戻す
-            // (指定を残したままだと、その画面が見つからず赤ランプのままになる)
-            curMon = cfg.Display;
-            if (curMon >= 0 && !DisplayExists(curMon)) curMon = -1;
-            cfg.Prefix = PrefixOf(curMon);
-            startMon = curMon;
-
             using (Graphics g = Graphics.FromHwnd(IntPtr.Zero)) S = g.DpiX / 96f;
 
             FormBorderStyle = FormBorderStyle.None;
@@ -696,12 +1046,7 @@ namespace Oscv
             SetAppIcon();
             Font = new Font("Yu Gothic UI", 9f, FontStyle.Regular, GraphicsUnit.Point);
 
-            for (int i = 0; i < 3; i++)
-                for (int j = 0; j < N; j++)
-                    presetVals[i, j] = cfg.Preset(i, j);
-
             BuildUi();
-            MarkMonButtons();
 
             TopMost = cfg.Pin;
             UpdatePin();
@@ -709,16 +1054,6 @@ namespace Oscv
             Point p = new Point(cfg.X, cfg.Y);
             if (cfg.X == int.MinValue || !OnAScreen(p, Size)) p = DefaultPos();
             Location = p;
-
-            // Seeded from last session; the worker replaces these ~200ms later.
-            for (int i = 0; i < N; i++)
-            {
-                int v = cfg.Last(i, CH[i].Min, CH[i].Max);
-                sl[i].SetValueSilent(v);
-                target[i] = v;
-                applied[i] = v;
-                lblVal[i].Text = v.ToString(CultureInfo.InvariantCulture);
-            }
 
             flashTimer = new System.Windows.Forms.Timer();
             flashTimer.Interval = 90;
@@ -729,8 +1064,8 @@ namespace Oscv
 
             // ワーカーからの BeginInvoke は、窓のハンドルが出来ていないと例外になる。
             // ハンドルが出来るのは Application.Run の中なので、起動直後の 1 回目
-            // (実値の表示・掴んだ画面番号の確定・「起動時」の有効化) が丸ごと
-            // 捨てられていた。ワーカーを起こす前にハンドルを作っておく
+            // (実値の表示・「起動時」の有効化) が丸ごと捨てられていた。
+            // ワーカーを起こす前にハンドルを作っておく
             IntPtr hwnd = Handle;
             Dbg.W("form handle=" + hwnd.ToInt64());
 
@@ -753,10 +1088,8 @@ namespace Oscv
             catch { }  // アイコンが無くても起動はできる
         }
 
-        // ---------- 画面の選択 ----------
-
-        // 左から右 (同じ位置なら上から下) に並べる。ボタンの並び順が机の上の
-        // 並びと一致していれば、番号を覚えていなくても見当がつく
+        // 左から右 (同じ位置なら上から下) に並べる。列の並び順が机の上の
+        // 並びと一致していれば、番号を見なくてもどちらの画面か分かる
         static Screen[] Displays()
         {
             List<Screen> l = new List<Screen>(Screen.AllScreens);
@@ -768,120 +1101,12 @@ namespace Oscv
             return l.ToArray();
         }
 
-        static bool DisplayExists(int num)
+        internal static Color StatusColor(string st)
         {
-            foreach (Screen s in Screen.AllScreens)
-                if (Ddc.NumOf(s.DeviceName) == num) return true;
-            return false;
-        }
-
-        // ini のキーを画面ごとに分ける。番号が決まらないうち (おまかせ) は
-        // v3 までのキーをそのまま使う
-        static string PrefixOf(int num)
-        {
-            return num < 0 ? "" : "m" + num.ToString(CultureInfo.InvariantCulture) + ".";
-        }
-
-        // 最終値もプリセットも画面ごとに持つ。板が違えば同じ「強」でも
-        // ちょうどいい値は違うため
-        void UseMonitor(int num)
-        {
-            curMon = num;
-            cfg.Prefix = PrefixOf(num);
-            for (int p = 0; p < 3; p++)
-                for (int i = 0; i < N; i++) presetVals[p, i] = cfg.Preset(p, i);
-            MarkMonButtons();
-        }
-
-        void MarkMonButtons()
-        {
-            for (int i = 0; i < monBtns.Length; i++)
-            {
-                bool on = monNums[i] == curMon;
-                if (monBtns[i].Selected == on) continue;
-                monBtns[i].Selected = on;
-                monBtns[i].Invalidate();
-            }
-        }
-
-        // 答えない画面のボタンを非活性にする。電源が落ちている板や、DDC を
-        // 通さないアダプタの先の板を選ばせても、赤ランプになるだけなので
-        void SetMonLive(int i, bool live)
-        {
-            monLive[i] = live;
-            monBtns[i].Enabled = live;
-            monBtns[i].Invalidate();
-            tip.SetToolTip(monBtns[i], monTipText[i] + (live ? "" : "  応答なし"));
-        }
-
-        // ワーカーから。onlyDead なら、いま死んでいる画面だけ見に行く
-        // (生きている画面を毎回叩くと、前面に出すたびに 60ms x 台数を捨てることになる)
-        void ProbeDisplays(bool onlyDead)
-        {
-            for (int i = 0; i < monNums.Length; i++)
-            {
-                if (onlyDead && monLive[i]) continue;
-
-                // いま掴めている板は、読めている時点で生きている
-                bool live = (Ddc.IsOpen && monNums[i] == Ddc.CurrentNum)
-                            || Ddc.Alive(monNums[i], ProbeCodes);
-                if (live == monLive[i]) continue;
-
-                int idx = i;
-                try { BeginInvoke((MethodInvoker)delegate { SetMonLive(idx, live); }); }
-                catch { }
-            }
-        }
-
-        void OnMonitor(int idx, MouseEventArgs e)
-        {
-            if (e.Button != MouseButtons.Left) return;
-            if (!monLive[idx]) return;   // 答えない画面は選ばせない
-            int num = monNums[idx];
-            if (num == curMon) return;
-
-            // いま表示している値は前の画面のもの。書きかけを捨ててから切り替える
-            lock (gate)
-            {
-                for (int i = 0; i < N; i++)
-                {
-                    dirty[i] = false;
-                    touched[i] = false;
-                    applied[i] = -1;   // 実値が読めるまで「不明」。次の書き込みを抑えない
-                }
-            }
-
-            cfg.Display = num;
-            UseMonitor(num);
-
-            // 種は ini の最終値。実値は 200ms 後にワーカーが上書きする
-            for (int i = 0; i < N; i++)
-            {
-                SetAvail(i, true);
-                int v = cfg.Last(i, CH[i].Min, CH[i].Max);
-                sl[i].SetValueSilent(v);
-                lblVal[i].Text = v.ToString(CultureInfo.InvariantCulture);
-                lock (gate) target[i] = v;
-            }
-
-            bootBtn.Enabled = false;   // 切り替え先の値を読むまでは戻り先が無い
-            bootBtn.Invalidate();
-
-            SetStatus("busy");
-            wantMon = num;
-            signal.Set();
-        }
-
-        // 対応していない項目は沈めて触れなくする。書けば必ず失敗するので、
-        // 赤ランプを出し続けるよりこの方が正しい
-        void SetAvail(int i, bool on)
-        {
-            avail[i] = on;
-            sl[i].Enabled = on;
-            sl[i].Invalidate();
-            lblName[i].ForeColor = on ? T.Label : T.TextDim;
-            lblVal[i].ForeColor = on ? T.Text : T.TextDim;
-            if (!on) lblVal[i].Text = "―";
+            if (st == "ok") return T.Ok;
+            if (st == "busy") return T.Busy;
+            if (st == "err") return T.Err;
+            return T.TextDim;
         }
 
         Point DefaultPos()
@@ -900,15 +1125,19 @@ namespace Oscv
 
         int Sc(double v) { return (int)Math.Round(v * S); }
 
+        // 画面の数だけ列を横に並べる。1 つなら v3 までと同じ窓の大きさ
         void BuildUi()
         {
-            int W = Sc(250);
-            int pad = Sc(15);
+            Screen[] scr = Displays();
+            int colW = Sc(ColW);
             int hh = Sc(26);
+            int totalW = colW * scr.Length;
+
+            Tip = new ToolTip();
 
             header = new Panel();
             header.BackColor = T.Header;
-            header.Bounds = new Rectangle(0, 0, W, hh);
+            header.Bounds = new Rectangle(0, 0, totalW, hh);
             header.MouseDown += HeaderDown;
             header.MouseMove += HeaderMove;
             header.MouseUp += HeaderUp;
@@ -929,137 +1158,65 @@ namespace Oscv
             header.Controls.Add(title);
 
             pinBtn = new PinBtn();
-            pinBtn.Bounds = new Rectangle(W - Sc(56), Sc(4), Sc(24), hh - Sc(8));
+            pinBtn.Bounds = new Rectangle(totalW - Sc(56), Sc(4), Sc(24), hh - Sc(8));
             pinBtn.Clicked += OnPin;
             header.Controls.Add(pinBtn);
 
             closeBtn = new Btn();
-            closeBtn.Bounds = new Rectangle(W - Sc(30), Sc(4), Sc(24), hh - Sc(8));
+            closeBtn.Bounds = new Rectangle(totalW - Sc(30), Sc(4), Sc(24), hh - Sc(8));
             closeBtn.Text = "✕";
             closeBtn.Font = new Font(Font.FontFamily, 8f);
             closeBtn.Clicked += delegate { Close(); };
             header.Controls.Add(closeBtn);
 
-            tip = new ToolTip();
-            int y = hh + Sc(10);
-
-            // 画面が 2 つ以上あるときだけ切り替えの列を出す。1 つなら v3 までと同じ窓
-            Screen[] scr = Displays();
-            if (scr.Length > 1)
+            cols = new Column[scr.Length];
+            int colH = 0;
+            for (int i = 0; i < scr.Length; i++)
             {
-                Label pick = new Label();
-                pick.AutoSize = false;
-                pick.Bounds = new Rectangle(pad, y, Sc(34), Sc(24));
-                pick.ForeColor = T.Label;
-                pick.Text = "画面";
-                pick.TextAlign = ContentAlignment.MiddleLeft;
-                pick.Font = new Font(Font.FontFamily, 8.5f);
-                Controls.Add(pick);
+                cols[i] = new Column(this, cfg, Ddc.NumOf(scr[i].DeviceName), S, colW, scr.Length > 1);
+                cols[i].Root.Location = new Point(i * colW, hh);
+                Controls.Add(cols[i].Root);
+                if (cols[i].Height > colH) colH = cols[i].Height;
+            }
+            foreach (Column c in cols) c.Root.Height = colH;
 
-                int bx = pad + Sc(38);
-                int gap = Sc(6);
-                int bw2 = (W - pad - bx - gap * (scr.Length - 1)) / scr.Length;
-                monBtns = new Btn[scr.Length];
-                monNums = new int[scr.Length];
-                monLive = new bool[scr.Length];
-                monTipText = new string[scr.Length];
-                for (int i = 0; i < scr.Length; i++)
-                {
-                    int idx = i;
-                    monNums[i] = Ddc.NumOf(scr[i].DeviceName);
-                    monLive[i] = true;   // 触れないと分かるまでは押せるままにする
-                    monBtns[i] = new Btn();
-                    monBtns[i].Bounds = new Rectangle(bx + i * (bw2 + gap), y, bw2, Sc(24));
-                    monBtns[i].Text = monNums[i].ToString(CultureInfo.InvariantCulture);
-                    monBtns[i].Font = new Font(Font.FontFamily, 8.5f);
-                    monBtns[i].Clicked += delegate(object s, MouseEventArgs e) { OnMonitor(idx, e); };
-                    // 同じ型の板が 2 枚並ぶと番号だけでは分からないので、大きさも出す
-                    monTipText[i] = "ディスプレイ " + monNums[i] + "  " +
-                        scr[i].Bounds.Width + " x " + scr[i].Bounds.Height +
-                        (scr[i].Primary ? " (メイン)" : "");
-                    tip.SetToolTip(monBtns[i], monTipText[i]);
-                    Controls.Add(monBtns[i]);
-                }
-                y += Sc(24) + Sc(12);
+            // 列の境目に細い線を引く。どこまでが 1 台ぶんか分かるように
+            for (int i = 1; i < cols.Length; i++)
+            {
+                Panel line = new Panel();
+                line.BackColor = T.Header;
+                line.Bounds = new Rectangle(i * colW, hh, 1, colH);
+                Controls.Add(line);
+                line.BringToFront();
             }
 
-            for (int i = 0; i < N; i++)
-            {
-                int idx = i;
-
-                lblName[i] = new Label();
-                lblName[i].AutoSize = false;
-                lblName[i].Bounds = new Rectangle(pad, y, W - pad * 2 - Sc(46), Sc(17));
-                lblName[i].ForeColor = T.Label;
-                lblName[i].Text = CH[i].Label;
-                lblName[i].TextAlign = ContentAlignment.MiddleLeft;
-                lblName[i].Font = new Font(Font.FontFamily, 8.5f);
-                Controls.Add(lblName[i]);
-
-                lblVal[i] = new Label();
-                lblVal[i].AutoSize = false;
-                lblVal[i].Bounds = new Rectangle(W - pad - Sc(46), y, Sc(46), Sc(17));
-                lblVal[i].ForeColor = T.Text;
-                lblVal[i].TextAlign = ContentAlignment.MiddleRight;
-                lblVal[i].Font = new Font(Font.FontFamily, 10.5f, FontStyle.Bold);
-                Controls.Add(lblVal[i]);
-
-                y += Sc(18);
-
-                sl[i] = new Slider();
-                sl[i].S = S;
-                sl[i].Min = CH[i].Min;
-                sl[i].Max = CH[i].Max;
-                sl[i].BackColor = T.Bg;
-                sl[i].Bounds = new Rectangle(pad - Sc(3), y, W - (pad - Sc(3)) * 2, Sc(28));
-                sl[i].ValueChanged += delegate { OnLive(idx); };
-                sl[i].ValueCommitted += delegate { Commit(idx); };
-                Controls.Add(sl[i]);
-
-                y += Sc(28) + Sc(10);
-            }
-
-            y += Sc(2);
-            // 弱 / 中 / 強 と「起動時」で 4 つ。1 行に収める
-            int gapp = Sc(6);
-            int bw = (W - pad * 2 - gapp * 3) / 4;
-            for (int i = 0; i < 3; i++)
-            {
-                int idx = i;
-                presets[i] = new Btn();
-                presets[i].Bounds = new Rectangle(pad + i * (bw + gapp), y, bw, Sc(24));
-                presets[i].Text = PresetNames[i];
-                presets[i].Font = new Font(Font.FontFamily, 8.5f);
-                presets[i].Clicked += delegate(object s, MouseEventArgs e) { OnPreset(idx, e); };
-                Controls.Add(presets[i]);
-            }
-
-            // 起動時の値に戻すボタン。値は自動で入るので、右クリックの保存は無い。
-            // 読めるまでは押せない
-            bootBtn = new Btn();
-            bootBtn.Bounds = new Rectangle(pad + 3 * (bw + gapp), y, bw, Sc(24));
-            bootBtn.Text = "起動時";
-            bootBtn.Font = new Font(Font.FontFamily, 8f);
-            bootBtn.Enabled = false;
-            bootBtn.Clicked += OnBoot;
-            Controls.Add(bootBtn);
-            tip.SetToolTip(bootBtn, "この画面を開いたときの値に戻す");
-            y += Sc(24) + Sc(13);
-
-            ClientSize = new Size(W, y);
+            ClientSize = new Size(totalW, hh + colH);
         }
 
+        // 列が 1 つのときだけヘッダーに状態ランプを出す (2 つ以上なら列の見出しに出る)
         void HeaderPaint(object sender, PaintEventArgs e)
         {
-            Color c = T.TextDim;
-            string st = status;
-            if (st == "ok") c = T.Ok;
-            else if (st == "busy") c = T.Busy;
-            else if (st == "err") c = T.Err;
+            if (cols.Length != 1) return;
 
             int d = Sc(7), x = Sc(10), yy = (header.Height - d) / 2;
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-            using (SolidBrush b = new SolidBrush(c)) e.Graphics.FillEllipse(b, x, yy, d, d);
+            using (SolidBrush b = new SolidBrush(StatusColor(cols[0].Status)))
+                e.Graphics.FillEllipse(b, x, yy, d, d);
+        }
+
+        internal void InvalidateHeader() { header.Invalidate(); }
+
+        public void Post(MethodInvoker m)
+        {
+            try { BeginInvoke(m); } catch { }
+        }
+
+        public void Wake() { signal.Set(); }
+
+        public bool AnyPending()
+        {
+            foreach (Column c in cols) if (c.HasPending()) return true;
+            return false;
         }
 
         void UpdatePin()
@@ -1076,7 +1233,7 @@ namespace Oscv
         }
 
         // ---------- window dragging ----------
-        void HeaderDown(object s, MouseEventArgs e)
+        public void HeaderDown(object s, MouseEventArgs e)
         {
             if (e.Button != MouseButtons.Left) return;
             moving = true;
@@ -1084,14 +1241,14 @@ namespace Oscv
             moveOrigin.Offset(-Location.X, -Location.Y);
         }
 
-        void HeaderMove(object s, MouseEventArgs e)
+        public void HeaderMove(object s, MouseEventArgs e)
         {
             if (!moving) return;
             Point p = Cursor.Position;
             Location = new Point(p.X - moveOrigin.X, p.Y - moveOrigin.Y);
         }
 
-        void HeaderUp(object s, MouseEventArgs e) { moving = false; }
+        public void HeaderUp(object s, MouseEventArgs e) { moving = false; }
 
         // ---------- wheel routing: hover is enough, no click required ----------
         const int WM_MOUSEWHEEL = 0x020A;
@@ -1101,9 +1258,9 @@ namespace Oscv
             if (m.Msg != WM_MOUSEWHEEL) return false;
             Slider s = Control.FromHandle(WindowFromPoint(Cursor.Position)) as Slider;
             if (s == null) return false;
-            for (int i = 0; i < N; i++)
+            foreach (Column c in cols)
             {
-                if (!ReferenceEquals(sl[i], s)) continue;
+                if (!c.Owns(s)) continue;
                 int delta = unchecked((short)(((long)m.WParam >> 16) & 0xFFFF));
                 s.Wheel(delta);
                 return true;
@@ -1114,28 +1271,6 @@ namespace Oscv
         [DllImport("user32.dll")]
         static extern IntPtr WindowFromPoint(Point p);
 
-        // ---------- value flow ----------
-        // A DDC write is ~60ms, so every change is pushed immediately and the
-        // worker coalesces to the newest value. The panel tracks the drag live.
-        void OnLive(int i)
-        {
-            touched[i] = true;
-            lblVal[i].Text = sl[i].Value.ToString(CultureInfo.InvariantCulture);
-            Commit(i);
-        }
-
-        void Commit(int i)
-        {
-            int v = sl[i].Value;
-            lock (gate)
-            {
-                if (target[i] == v && !dirty[i]) return;
-                target[i] = v;
-                dirty[i] = true;
-            }
-            signal.Set();
-        }
-
         // Re-read when the window is brought forward, so changes made with the
         // monitor's own buttons show up.
         protected override void OnActivated(EventArgs e)
@@ -1145,208 +1280,56 @@ namespace Oscv
             signal.Set();
         }
 
-        // 起動時の値に戻す。押せるのは 1 つでも値を掴めているときだけ
-        void OnBoot(object s, MouseEventArgs e)
-        {
-            if (e.Button != MouseButtons.Left) return;   // 自動保存なので右クリックは無し
-
-            for (int i = 0; i < N; i++)
-            {
-                if (!avail[i] || !bootGot[i]) continue;
-                sl[i].Value = boot[i];
-                touched[i] = true;
-                lblVal[i].Text = sl[i].Value.ToString(CultureInfo.InvariantCulture);
-                Commit(i);
-            }
-            bootBtn.Flash = 3;
-            bootBtn.Invalidate();
-        }
-
-        // ワーカーが最初の実値を掴んだところで押せるようにする
-        void SetBootReady()
-        {
-            StringBuilder sb = new StringBuilder("この画面を開いたときの値に戻す");
-            bool any = false;
-            for (int i = 0; i < N; i++)
-            {
-                if (!bootGot[i]) continue;
-                sb.Append(any ? " / " : "  ").Append(boot[i].ToString(CultureInfo.InvariantCulture));
-                any = true;
-            }
-            bootBtn.Enabled = any;
-            bootBtn.Invalidate();
-            tip.SetToolTip(bootBtn, sb.ToString());
-        }
-
-        void OnPreset(int p, MouseEventArgs e)
-        {
-            if (e.Button == MouseButtons.Right)
-            {
-                // 沈んでいる項目はこの画面に無い。前の値をそのまま残す
-                for (int i = 0; i < N; i++) if (avail[i]) presetVals[p, i] = sl[i].Value;
-                cfg.SavePreset(p, presetVals);
-                presets[p].Flash = 5;
-                presets[p].Invalidate();
-                return;
-            }
-            if (e.Button != MouseButtons.Left) return;
-
-            for (int i = 0; i < N; i++)
-            {
-                if (!avail[i]) continue;
-                sl[i].Value = presetVals[p, i];
-                touched[i] = true;
-                lblVal[i].Text = sl[i].Value.ToString(CultureInfo.InvariantCulture);
-                Commit(i);
-            }
-            presets[p].Flash = 3;
-            presets[p].Invalidate();
-        }
-
         void OnFlash(object s, EventArgs e)
         {
-            for (int i = 0; i < 3; i++)
-                if (presets[i].Flash > 0) { presets[i].Flash--; presets[i].Invalidate(); }
-            if (bootBtn.Flash > 0) { bootBtn.Flash--; bootBtn.Invalidate(); }
-        }
-
-        void SetStatus(string st)
-        {
-            if (status == st) return;
-            status = st;
-            try { BeginInvoke((MethodInvoker)delegate { header.Invalidate(); }); } catch { }
+            foreach (Column c in cols) c.Tick();
         }
 
         // ---------- background worker ----------
-        bool ReadAll()
-        {
-            bool healthy = false;
-            bool gotBoot = false;
-            for (int i = 0; i < N; i++)
-            {
-                if (HasPending()) return true;   // user is driving; their value wins
-                if (!avail[i]) continue;         // この画面には無い項目
-
-                int raw = Ddc.Read(CH[i].Vcp, ProbeVcp);
-                Dbg.W("ReadAll " + CH[i].Label + " vcp" + CH[i].Vcp.ToString("X2") + " -> " + raw);
-                if (raw < 0)
-                {
-                    // 他の項目が読めているなら線は生きている。この項目だけが
-                    // 無い板ということなので、沈めて触れなくする
-                    if (healthy) MarkMissing(i);
-                    continue;
-                }
-                healthy = true;
-
-                int v = (int)Math.Round((double)raw / CH[i].GetDiv);
-                if (v < CH[i].Min) v = CH[i].Min;
-                if (v > CH[i].Max) v = CH[i].Max;
-
-                int idx = i, vv = v;
-                lock (gate)
-                {
-                    applied[idx] = vv;
-                    if (!touched[idx]) target[idx] = vv;
-                }
-
-                // 「起動時」= その画面で最初に読めた値。読めた順に 1 項目ずつ
-                // 押さえるので、途中で操作されても掴んだぶんは正しい
-                if (!bootGot[idx])
-                {
-                    boot[idx] = vv;
-                    bootGot[idx] = true;
-                    gotBoot = true;
-                }
-
-                try
-                {
-                    BeginInvoke((MethodInvoker)delegate
-                    {
-                        if (touched[idx]) return;
-                        sl[idx].SetValueSilent(vv);
-                        lblVal[idx].Text = vv.ToString(CultureInfo.InvariantCulture);
-                    });
-                }
-                catch { }
-            }
-            if (gotBoot)
-                try { BeginInvoke((MethodInvoker)delegate { SetBootReady(); }); } catch { }
-            return healthy;
-        }
-
-        // ワーカー側から。UI の更新だけ投げ、判定はその場で持つ
-        // (次の ReadAll がまた 700ms かけて読みに行かないように)
-        void MarkMissing(int i)
-        {
-            if (!avail[i]) return;
-            avail[i] = false;
-            Dbg.W("  display" + Ddc.CurrentNum + " has no vcp" + CH[i].Vcp.ToString("X2"));
-            try { BeginInvoke((MethodInvoker)delegate { SetAvail(i, false); }); } catch { }
-        }
-
-        // おまかせで開いたときは、どの画面になったかを UI に伝える
-        // (ini のキーとボタンの点灯がそれで決まる)
-        void SyncSelection()
-        {
-            int n = Ddc.CurrentNum;
-            if (n < 0 || n == curMon) return;
-            try { BeginInvoke((MethodInvoker)delegate { UseMonitor(n); }); } catch { }
-        }
-
+        // DDC は 1 本のシリアル線なので、列が増えてもワーカーは 1 本のまま。
+        // 書きたい値があればそれを最優先で流し、無いときに読み直す
         void WorkerLoop()
         {
-            SetStatus("busy");
-            SetStatus(Ddc.Open(ProbeVcp, startMon) && ReadAll() ? "ok" : "err");
-            SyncSelection();
-            ProbeDisplays(false);   // 実値を出した後で、残りの画面の生死を調べる
+            foreach (Column c in cols) c.SetStatus("busy");
+
+            bool opened = Ddc.Open();
+            Dbg.W("worker: open=" + opened + " columns=" + cols.Length);
+            foreach (Column c in cols) c.SetStatus(opened && c.ReadAll() ? "ok" : "err");
+            ProbeLive(false);   // 実値を出した後で、答えない画面を沈める
 
             int lastHeal = Environment.TickCount;
 
             while (alive)
             {
+                Column w = null;
                 int ch = -1, val = 0;
-                lock (gate)
-                {
-                    for (int i = 0; i < N; i++)
-                    {
-                        if (!dirty[i]) continue;
-                        if (target[i] != applied[i]) { ch = i; val = target[i]; break; }
-                        dirty[i] = false;
-                    }
-                }
+                foreach (Column c in cols)
+                    if (c.NextPending(out ch, out val)) { w = c; break; }
 
-                if (ch < 0)
+                if (w == null)
                 {
                     if (closing) break;
 
-                    int mw = wantMon;
-                    if (mw != NoSwitch)
-                    {
-                        // 画面の切り替え。掴み直して、その板の実値を読み直す
-                        wantMon = NoSwitch;
-                        SetStatus("busy");
-                        // 「起動時」は画面ごとに持ち直す。切り替えた先の板を
-                        // 最初に読んだ値が、その板の戻り先になる
-                        for (int i = 0; i < N; i++)
-                        { touched[i] = false; avail[i] = true; bootGot[i] = false; }
-                        SetStatus(Ddc.Open(ProbeVcp, mw) && ReadAll() ? "ok" : "err");
-                    }
-                    else if (refreshWanted)
+                    if (refreshWanted)
                     {
                         refreshWanted = false;
-                        for (int i = 0; i < N; i++) touched[i] = false;
-                        if (ReadAll()) SetStatus("ok");
-                        SyncSelection();   // 起動直後に取りこぼしていたら、ここで揃える
+                        foreach (Column c in cols)
+                        {
+                            c.ForgetTouched();
+                            if (c.ReadAll()) c.SetStatus("ok");
+                        }
                         // 消えていた画面の電源が入ったかもしれない。前面に
                         // 出したこの機会に見に行く (生きている画面は叩かない)
-                        ProbeDisplays(true);
+                        ProbeLive(true);
                     }
-                    else if (status == "err" && Environment.TickCount - lastHeal > 5000)
+                    else if (AnyErr() && Environment.TickCount - lastHeal > 5000)
                     {
                         // cable replugged / monitor woke up / DDC re-enabled
                         lastHeal = Environment.TickCount;
-                        SetStatus(Ddc.Reopen(ProbeVcp) && ReadAll() ? "ok" : "err");
-                        SyncSelection();
+                        Ddc.Open();
+                        foreach (Column c in cols)
+                            if (c.Status == "err") c.SetStatus(c.ReadAll() ? "ok" : "err");
+                        ProbeLive(true);
                     }
 
                     signal.WaitOne(500);
@@ -1357,14 +1340,9 @@ namespace Oscv
                 if (val < CH[ch].Min) val = CH[ch].Min;
                 if (val > CH[ch].Max) val = CH[ch].Max;
 
-                bool ok = Ddc.Write(CH[ch].Vcp, val, ProbeVcp);
-
-                lock (gate)
-                {
-                    if (ok) applied[ch] = val;
-                    if (target[ch] == val) dirty[ch] = false;
-                }
-                SetStatus(ok ? "ok" : "err");
+                bool ok = Ddc.Write(w.Num, CH[ch].Vcp, val);
+                w.AfterWrite(ch, val, ok);
+                w.SetStatus(ok ? "ok" : "err");
             }
 
             Ddc.Close();
@@ -1372,13 +1350,28 @@ namespace Oscv
             try { BeginInvoke((MethodInvoker)delegate { Close(); }); } catch { }
         }
 
-        bool HasPending()
+        bool AnyErr()
         {
-            lock (gate)
-            {
-                for (int i = 0; i < N; i++) if (dirty[i]) return true;
-            }
+            foreach (Column c in cols) if (c.Status == "err") return true;
             return false;
+        }
+
+        // 答えない画面の列を沈める。onlyDead なら、いま死んでいる列だけ見に行く
+        // (生きている列を毎回叩くと、前面に出すたびに 60ms x 台数を捨てることになる)
+        void ProbeLive(bool onlyDead)
+        {
+            foreach (Column c in cols)
+            {
+                if (onlyDead && c.Live) continue;
+
+                // 読めている列は、その時点で生きている
+                bool live = c.Status == "ok" || Ddc.Alive(c.Num, ProbeCodes);
+                if (live == c.Live) continue;
+
+                Column cc = c;
+                bool lv = live;
+                Post(delegate { cc.SetLive(lv); });
+            }
         }
 
         protected override void OnFormClosing(FormClosingEventArgs e)
@@ -1386,10 +1379,10 @@ namespace Oscv
             cfg.X = Location.X;
             cfg.Y = Location.Y;
             cfg.Pin = TopMost;
-            for (int i = 0; i < N; i++) if (avail[i]) cfg.SetLast(i, sl[i].Value);
+            foreach (Column c in cols) c.SaveLast();
             cfg.Save();
 
-            if (!workerDone && HasPending())
+            if (!workerDone && AnyPending())
             {
                 e.Cancel = true;
                 closing = true;
@@ -1448,6 +1441,8 @@ namespace Oscv
             }
 
             Cfg cfg = Cfg.Load();
+            Ddc.Open();
+
             bool allOk = true;
             for (int k = 0; k < nums.Count; k++)
                 if (!Apply(cfg, nums[k], presets[k])) allOk = false;
@@ -1489,44 +1484,49 @@ namespace Oscv
             // 黙って別の板に書くことだけは避ける。
             // ただし直前に別プロセスが DDC を叩いていると最初の一撃が空振りする
             // ことがあるので、一度だけ置いて出し直す (GUI と違って一発勝負なので)
-            if (!Ddc.Open(MainForm.ProbeVcp, num))
+            if (!Ready(num))
             {
                 Thread.Sleep(120);
-                if (!Ddc.Open(MainForm.ProbeVcp, num))
+                Ddc.Open();
+                if (!Ready(num))
                 {
-                    Dbg.W("cli:   display" + num + " が開けません");
+                    Dbg.W("cli:   display" + num + " が答えません");
                     return false;
                 }
             }
-
-            cfg.Prefix = "m" + num.ToString(CultureInfo.InvariantCulture) + ".";
 
             bool any = false;
             for (int i = 0; i < MainForm.N; i++)
             {
                 Channel c = MainForm.CH[i];
-                int v = cfg.Preset(p, i);
+                int v = cfg.Preset(num, p, i);
                 if (v < c.Min) v = c.Min;   // 範囲外は黙って無視されるので必ず丸める
                 if (v > c.Max) v = c.Max;
 
-                bool ok = WriteVerified(c, v);
+                bool ok = WriteVerified(num, c, v);
                 Dbg.W("cli:   vcp" + c.Vcp.ToString("X2") + " <- " + v + (ok ? "" : "  失敗"));
                 any |= ok;
             }
             return any;
         }
 
+        // その画面を掴めていて、DDC にも答えるか
+        static bool Ready(int num)
+        {
+            return Ddc.Has(num) && Ddc.Alive(num, MainForm.ProbeCodes);
+        }
+
         // 「書けた」と言われても板が黙って無視することがある (SetVCPFeature は
         // 範囲外でも true を返すし、DDC 自体たまに取りこぼす)。窓を出さない分だけ
         // 結果が目に見えないので、読み返して確かめ、違っていたら一度だけ書き直す。
         // その板に無い項目 (LG 以外の 0xF9 など) はここで false になって次へ進む
-        static bool WriteVerified(Channel c, int v)
+        static bool WriteVerified(int num, Channel c, int v)
         {
             for (int attempt = 0; attempt < 2; attempt++)
             {
-                Ddc.Write(c.Vcp, v, MainForm.ProbeVcp);
+                Ddc.Write(num, c.Vcp, v);
                 Thread.Sleep(40);   // DDC は続けざまの往復に弱い。少し置いてから読む
-                int raw = Ddc.Peek(c.Vcp);
+                int raw = Ddc.Peek(num, c.Vcp);
                 if (raw >= 0 && (int)Math.Round((double)raw / c.GetDiv) == v) return true;
             }
             return false;
@@ -1600,8 +1600,6 @@ namespace Oscv
             }
         }
 
-        // 画面ごとに分けるキーの接頭辞 ("m2." など)。空なら v3 までのキー
-        public string Prefix = "";
 
         int GetI(string k, int def)
         {
@@ -1611,18 +1609,23 @@ namespace Oscv
             return int.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out v) ? v : def;
         }
 
-        // 画面ごとの値。**番号なしのキーへは落とさない。**
-        // 落とすと 1 台目で保存した値が 2 台目の出発点になり、板ごとに分けている
-        // 意味がなくなる (2 台目の適正値は 1 台目とは違う)。
-        // まだ持っていない画面は、素の初期値から始める
-        int GetPer(string k, int def)
+        // 画面ごとの値。キーは画面番号を頭に付ける (m2.last0 など)。
+        // **番号なしのキーへは落とさない。** 落とすと 1 台目で保存した値が
+        // 2 台目の出発点になり、板ごとに分けている意味がなくなる。
+        // まだ値を持っていない画面は、素の初期値から始める
+        static string Pre(int num)
         {
-            return GetI(Prefix + k, def);
+            return "m" + num.ToString(CultureInfo.InvariantCulture) + ".";
         }
 
-        void SetPer(string k, int v)
+        int GetPer(int num, string k, int def)
         {
-            d[Prefix + k] = v.ToString(CultureInfo.InvariantCulture);
+            return GetI(Pre(num) + k, def);
+        }
+
+        void SetPer(int num, string k, int v)
+        {
+            d[Pre(num) + k] = v.ToString(CultureInfo.InvariantCulture);
         }
 
         public int X
@@ -1643,29 +1646,25 @@ namespace Oscv
             set { d["pin"] = value ? "1" : "0"; }
         }
 
-        // 操作する画面。-1 = おまかせ (ベンダー固有コードに答える板を選ぶ)
-        public int Display
+        public int Last(int num, int i, int min, int max)
         {
-            get { return GetI("display", -1); }
-            set { d["display"] = value.ToString(CultureInfo.InvariantCulture); }
-        }
-
-        public int Last(int i, int min, int max)
-        {
-            int v = GetPer("last" + i, (min + max) / 2);
+            int v = GetPer(num, "last" + i, (min + max) / 2);
             return v < min ? min : (v > max ? max : v);
         }
 
-        public void SetLast(int i, int v)
+        public void SetLast(int num, int i, int v)
         {
-            SetPer("last" + i, v);
+            SetPer(num, "last" + i, v);
         }
 
-        public int Preset(int p, int i) { return GetPer("preset" + p + "_" + i, DefPreset[p, i]); }
-
-        public void SavePreset(int p, int[,] vals)
+        public int Preset(int num, int p, int i)
         {
-            for (int i = 0; i < 3; i++) SetPer("preset" + p + "_" + i, vals[p, i]);
+            return GetPer(num, "preset" + p + "_" + i, DefPreset[p, i]);
+        }
+
+        public void SavePreset(int num, int p, int[,] vals)
+        {
+            for (int i = 0; i < 3; i++) SetPer(num, "preset" + p + "_" + i, vals[p, i]);
             Save();
         }
 
