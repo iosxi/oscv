@@ -16,7 +16,7 @@ namespace Oscv
     static class App
     {
         // 版番号はここが唯一の出どころ (build.ps1 が読む)。v1 から 1 ずつ上げる。
-        public const int Version = 10;
+        public const int Version = 11;
     }
 
     // ================= theme =================
@@ -1030,6 +1030,9 @@ namespace Oscv
 
         Cfg cfg;
 
+        // BuildUi が決めた、ただ 1 つの正しい窓の大きさ
+        Size fixedSize;
+
         public MainForm()
         {
             cfg = Cfg.Load();
@@ -1037,6 +1040,9 @@ namespace Oscv
 
             FormBorderStyle = FormBorderStyle.None;
             StartPosition = FormStartPosition.Manual;
+            // 中身の大きさは Sc() で自前に決めている。WinForms の自動スケールに
+            // 手を出されると、画面構成が変わったときに勝手に測り直されてしまう
+            AutoScaleMode = AutoScaleMode.None;
             BackColor = T.Bg;
             Text = "OSCV";
             SetAppIcon();
@@ -1185,7 +1191,8 @@ namespace Oscv
             // WM_NCCALCSIZE で非クライアント領域を 0 にしてあるので、
             // クライアント領域 = ウィンドウの大きさ。ClientSize から逆算させると
             // 付けたスタイルぶん (キャプションの高さ) だけ大きくなってしまう
-            Size = new Size(totalW, hh + colH);
+            fixedSize = new Size(totalW, hh + colH);
+            Size = fixedSize;
         }
 
         // 列が 1 つのときだけヘッダーに状態ランプを出す (2 つ以上なら列の見出しに出る)
@@ -1276,7 +1283,50 @@ namespace Oscv
             // 0 を返す = クライアント領域がウィンドウ全体。非クライアント領域が
             // 残らないので、キャプションも枠も描かれない
             if (m.Msg == WM_NCCALCSIZE && m.WParam != IntPtr.Zero) { m.Result = IntPtr.Zero; return; }
+            if (m.Msg == WM_WINDOWPOSCHANGING) ClampSize(ref m);
             base.WndProc(ref m);
+        }
+
+        // ---------- 窓が縦に伸びるのを止める ----------
+        // スリープ復帰のあとや、画面を抜き差ししたあとに、窓の高さがキャプション
+        // 1 つぶん伸びることがあった。非クライアント領域は WM_NCCALCSIZE で 0 に
+        // してあるが、スタイルの上では WS_CAPTION が付いたままなので、
+        // 「クライアントの大きさ + 枠」で窓の大きさを計算し直す処理が走るたびに、
+        // ありもしないキャプションの高さが足されてしまう
+        // (最小化からの復帰で走る Form.RestoreWindowBoundsIfNecessary が代表例。
+        // 画面の抜き差しやスリープ復帰では、シェルが窓を最小化・復帰させることがある)。
+        //
+        // 正しい大きさは BuildUi が決めた 1 つだけなので、大きさが変わる直前
+        // (WM_WINDOWPOSCHANGING) に毎回そこへ戻す。誰が計算し直しても効く。
+        // 最小化・最大化の最中は状態変化の側に任せて手を出さない
+        const int WM_WINDOWPOSCHANGING = 0x0046;
+        const int SWP_NOSIZE = 0x0001;
+        const int SWP_STATECHANGED = 0x8000;  // 最小化/復帰などの状態変化 (非公開だが昔から不変)
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct WINDOWPOS
+        {
+            public IntPtr hwnd;
+            public IntPtr hwndInsertAfter;
+            public int x, y, cx, cy, flags;
+        }
+
+        [DllImport("user32.dll")]
+        static extern bool IsIconic(IntPtr hWnd);
+        [DllImport("user32.dll")]
+        static extern bool IsZoomed(IntPtr hWnd);
+
+        void ClampSize(ref Message m)
+        {
+            if (fixedSize.IsEmpty || m.LParam == IntPtr.Zero) return;
+            WINDOWPOS wp = (WINDOWPOS)Marshal.PtrToStructure(m.LParam, typeof(WINDOWPOS));
+            if ((wp.flags & (SWP_NOSIZE | SWP_STATECHANGED)) != 0) return;
+            if (IsIconic(Handle) || IsZoomed(Handle)) return;
+            if (wp.cx == fixedSize.Width && wp.cy == fixedSize.Height) return;
+            Dbg.W("size fixup " + wp.cx + "x" + wp.cy + " -> " + fixedSize.Width + "x" + fixedSize.Height);
+            wp.cx = fixedSize.Width;
+            wp.cy = fixedSize.Height;
+            Marshal.StructureToPtr(wp, m.LParam, false);
         }
 
         [DllImport("user32.dll")]

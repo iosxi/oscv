@@ -281,6 +281,28 @@ OnScreen Control を常駐させない方が安定する。
   `WS_MAXIMIZEBOX` が残る）。`CreateParams` で明示的に落とす。残っていると
   上端ドラッグの Aero Snap で全画面になってしまう
 
+**対策 3 (v11): 大きさは毎回 `WM_WINDOWPOSCHANGING` で戻す。** 上の「`ClientSize` で
+決めてはいけない」は自分のコードだけの話ではない。スタイルに `WS_CAPTION` が
+付いている以上、**WinForms や OS の側が「クライアントの大きさ + 枠」で窓を
+計算し直すたびに、ありもしないキャプションの高さ (100% で 31px 前後) が足される**。
+実際に v10 で、スリープ復帰後やディスプレイの抜き差し後に窓が縦に伸びた。
+
+代表的な足し算の出どころは `Form.RestoreWindowBoundsIfNecessary()` で、
+最小化からの復帰時に `SizeFromClientSize()` を通す。画面構成が変わったときや
+スリープ復帰時はシェルが窓を最小化・復帰させることがあるので、伸びるのが
+「たまに」なのはそのため。他にも自動スケールなど経路は複数ありうる。
+
+出どころを 1 つずつ潰すより、**出口で毎回正しい大きさへ戻す**方が確実:
+
+- `BuildUi` が決めた大きさを `fixedSize` に持っておく
+- `WM_WINDOWPOSCHANGING` で `WINDOWPOS.cx/cy` を `fixedSize` に書き戻す。
+  誰が計算し直しても、実際に窓が変わる前に必ずここを通る
+- ただし `SWP_NOSIZE` と `SWP_STATECHANGED` (0x8000) の付いたものには手を出さない。
+  最小化・最大化そのものを壊さないため。復帰後の伸びは、状態変化のあとに
+  別の `SetWindowPos` として来るのでこれで捕まる
+- ついでに `AutoScaleMode = None`。中身の大きさは `Sc()` で自前に決めているので、
+  WinForms に測り直させる理由がない
+
 **対策 2: 移動は OS に任せる。** 掴んだら `ReleaseCapture()` してから
 `WM_NCLBUTTONDOWN` に `HTCAPTION` を送る。自前で `Location` を書き換えると
 `WM_ENTERSIZEMOVE` も `EVENT_SYSTEM_MOVESIZESTART` も発生しないため、
