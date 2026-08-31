@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
@@ -16,7 +16,7 @@ namespace Oscv
     static class App
     {
         // 版番号はここが唯一の出どころ (build.ps1 が読む)。v1 から 1 ずつ上げる。
-        public const int Version = 11;
+        public const int Version = 12;
     }
 
     // ================= theme =================
@@ -337,6 +337,24 @@ namespace Oscv
                 return idx >= 0 && SetVCPFeature(phys[idx].Handle, code, (uint)val);
             }
         }
+
+        // 「書けた」と言われても板が黙って無視することがある (SetVCPFeature は
+        // 範囲外でも true を返すし、DDC 自体たまに取りこぼす)。読み返して確かめ、
+        // 違っていたら書き直す。呼ぶ側は範囲内に丸めてから渡すこと。
+        // その板に無い項目 (LG 以外の 0xF9 など) は読めないので false になる
+        public static bool WriteVerified(int num, Channel c, int v)
+        {
+            for (int attempt = 0; attempt < 3; attempt++)
+            {
+                Write(num, c.Vcp, v);
+                Thread.Sleep(40);   // DDC は続けざまの往復に弱い。少し置いてから読む
+                int raw = Peek(num, c.Vcp);
+                if (raw >= 0 && (int)Math.Round((double)raw / c.GetDiv) == v) return true;
+                Dbg.W("  verify display" + num + " vcp" + c.Vcp.ToString("X2") +
+                      " <- " + v + " but read " + raw + " (attempt " + (attempt + 1) + ")");
+            }
+            return false;
+        }
     }
 
     // ================= channel model =================
@@ -569,6 +587,43 @@ namespace Oscv
         }
     }
 
+    // ================= 再適用ボタン =================
+    // ぐるりと回る矢印。押すといまの値をもう一度モニターへ送り直す
+    class ReapplyBtn : Btn
+    {
+        // 円の終わりに置く矢じり。先端が上 (-Y) を向いた状態で持ち、
+        // 描くときに接線の向きまで回す
+        static readonly PointF[] Head = new PointF[] {
+            new PointF( 0.0f, -3.3f),
+            new PointF( 2.9f,  1.9f),
+            new PointF(-2.9f,  1.9f)
+        };
+
+        const float EndDeg = 232f;   // 円が途切れる角度 (時計回りの終わり)
+        const float R = 7.0f;        // 24 単位四方の中での半径
+
+        protected override void DrawGlyph(Graphics g, Color fg)
+        {
+            float scale = Math.Min(Width, Height) / 24f;
+            GraphicsState st = g.Save();
+            g.TranslateTransform(Width / 2f, Height / 2f);
+            g.ScaleTransform(scale, scale);
+            g.TranslateTransform(-12f, -12f);
+
+            // 上を少しだけ開けて回す。開いた先が矢じりの場所になる
+            // 線幅も一緒に拡縮されるので、実寸で約 1.7px になるよう割り戻す
+            using (Pen pen = new Pen(fg, 1.7f / scale))
+                g.DrawArc(pen, 12f - R, 12f - R, R * 2, R * 2, -52f, 275f);
+
+            double rad = EndDeg * Math.PI / 180.0;
+            g.TranslateTransform(12f + R * (float)Math.Cos(rad), 12f + R * (float)Math.Sin(rad));
+            g.RotateTransform(EndDeg + 180f);   // 先端を進行方向 (接線) に向ける
+            using (SolidBrush b = new SolidBrush(fg)) g.FillPolygon(b, Head);
+
+            g.Restore(st);
+        }
+    }
+
     // ================= main form =================
     // ================= 1 画面ぶんの操作列 =================
     // ディスプレイ 1 台ぶんの UI と状態。自分の画面番号だけを読み書きする。
@@ -598,6 +653,11 @@ namespace Oscv
         int[] target = new int[MainForm.N];
         int[] applied = new int[MainForm.N];
         bool[] dirty = new bool[MainForm.N];
+        bool[] verify = new bool[MainForm.N];   // 書いた後に読み返して確かめるか
+
+        // applied に入れると target と必ず食い違う値。「この値はまだ板に
+        // 入っていない」と言い切るための印で、実在する明るさではない
+        const int NotApplied = int.MinValue;
 
         volatile bool[] touched = new bool[MainForm.N];
         volatile bool[] avail = new bool[MainForm.N];
@@ -806,6 +866,25 @@ namespace Oscv
             bootBtn.Invalidate();
         }
 
+        // いまの値をもう一度書き直す。DDC の取りこぼしで指定が板に入らなかった
+        // ときの入れ直しで、同じ値でも必ず書く (スライダーを別の値にしてから
+        // 戻す、という手間を無くすためのボタン)。
+        // ここだけは読み返して確かめるので、入れ直しの一撃も落ちたら書き直す
+        public void Reapply()
+        {
+            lock (gate)
+            {
+                for (int i = 0; i < MainForm.N; i++)
+                {
+                    if (!avail[i]) continue;
+                    target[i] = sl[i].Value;
+                    applied[i] = NotApplied;
+                    dirty[i] = true;
+                    verify[i] = true;
+                }
+            }
+        }
+
         public void Tick()
         {
             for (int i = 0; i < 3; i++)
@@ -843,6 +922,7 @@ namespace Oscv
             bootBtn.Enabled = live && AnyBoot();
             bootBtn.Invalidate();
             if (caption != null) caption.Invalidate();
+            form.UpdateReapply();
         }
 
         bool AnyBoot()
@@ -880,19 +960,22 @@ namespace Oscv
 
         // ---------- ワーカーから ----------
 
-        public bool NextPending(out int ch, out int val)
+        public bool NextPending(out int ch, out int val, out bool check)
         {
             lock (gate)
             {
                 for (int i = 0; i < MainForm.N; i++)
                 {
                     if (!dirty[i]) continue;
-                    if (target[i] != applied[i]) { ch = i; val = target[i]; return true; }
+                    if (target[i] != applied[i])
+                    { ch = i; val = target[i]; check = verify[i]; return true; }
                     dirty[i] = false;
+                    verify[i] = false;
                 }
             }
             ch = -1;
             val = 0;
+            check = false;
             return false;
         }
 
@@ -900,8 +983,10 @@ namespace Oscv
         {
             lock (gate)
             {
+                // 駄目だったときに applied を触らないのは、「入っていない」まま
+                // 次の読み直しで実値に上書きさせるため
                 if (ok) applied[ch] = val;
-                if (target[ch] == val) dirty[ch] = false;
+                if (target[ch] == val) { dirty[ch] = false; verify[ch] = false; }
             }
         }
 
@@ -1019,6 +1104,7 @@ namespace Oscv
         Label title;
         Btn closeBtn;
         PinBtn pinBtn;
+        ReapplyBtn reapplyBtn;
         System.Windows.Forms.Timer flashTimer;
         public ToolTip Tip;
 
@@ -1155,6 +1241,15 @@ namespace Oscv
             title.MouseDown += HeaderDown;
             header.Controls.Add(title);
 
+            // 取りこぼし対策。窓のいちばん外側 (どの列にも属さない場所) に置いて、
+            // 「全部まとめて送り直す」ことを見た目でも表す
+            reapplyBtn = new ReapplyBtn();
+            reapplyBtn.Bounds = new Rectangle(totalW - Sc(82), Sc(4), Sc(24), hh - Sc(8));
+            reapplyBtn.Clicked += OnReapply;
+            header.Controls.Add(reapplyBtn);
+            Tip.SetToolTip(reapplyBtn, "いまの値をモニターへ送り直す" + Environment.NewLine +
+                                       "(Windows が変更を取りこぼしたとき)");
+
             pinBtn = new PinBtn();
             pinBtn.Bounds = new Rectangle(totalW - Sc(56), Sc(4), Sc(24), hh - Sc(8));
             pinBtn.Clicked += OnPin;
@@ -1177,6 +1272,7 @@ namespace Oscv
                 if (cols[i].Height > colH) colH = cols[i].Height;
             }
             foreach (Column c in cols) c.Root.Height = colH;
+            UpdateReapply();
 
             // 列の境目に細い線を引く。どこまでが 1 台ぶんか分かるように
             for (int i = 1; i < cols.Length; i++)
@@ -1232,6 +1328,28 @@ namespace Oscv
             TopMost = !TopMost;
             cfg.Pin = TopMost;
             UpdatePin();
+        }
+
+        // 画面に出ている値をそのまま、全部の列ぶん書き直させる。
+        // 値を変えないので、どこを取りこぼしたか分からないまま押して構わない
+        void OnReapply(object s, MouseEventArgs e)
+        {
+            if (e.Button != MouseButtons.Left) return;
+            foreach (Column c in cols) if (c.Live) c.Reapply();
+            reapplyBtn.Flash = 3;
+            reapplyBtn.Invalidate();
+            signal.Set();
+        }
+
+        // 答える画面が 1 つも無ければ押せない (プリセットと同じ扱い)
+        internal void UpdateReapply()
+        {
+            if (reapplyBtn == null) return;
+            bool any = false;
+            foreach (Column c in cols) if (c.Live) { any = true; break; }
+            if (reapplyBtn.Enabled == any) return;
+            reapplyBtn.Enabled = any;
+            reapplyBtn.Invalidate();
         }
 
         // ---------- window dragging ----------
@@ -1370,6 +1488,7 @@ namespace Oscv
         void OnFlash(object s, EventArgs e)
         {
             foreach (Column c in cols) c.Tick();
+            if (reapplyBtn.Flash > 0) { reapplyBtn.Flash--; reapplyBtn.Invalidate(); }
         }
 
         // ---------- background worker ----------
@@ -1390,8 +1509,9 @@ namespace Oscv
             {
                 Column w = null;
                 int ch = -1, val = 0;
+                bool check = false;
                 foreach (Column c in cols)
-                    if (c.NextPending(out ch, out val)) { w = c; break; }
+                    if (c.NextPending(out ch, out val, out check)) { w = c; break; }
 
                 if (w == null)
                 {
@@ -1427,7 +1547,12 @@ namespace Oscv
                 if (val < CH[ch].Min) val = CH[ch].Min;
                 if (val > CH[ch].Max) val = CH[ch].Max;
 
-                bool ok = Ddc.Write(w.Num, CH[ch].Vcp, val);
+                // ドラッグ中は次の値がすぐ来るので確かめない (往復のぶん重くなるし、
+                // どうせ上書きされる)。再適用ボタンで来たぶんだけ読み返して確かめる
+                bool ok = check ? Ddc.WriteVerified(w.Num, CH[ch], val)
+                                : Ddc.Write(w.Num, CH[ch].Vcp, val);
+                Dbg.W("write display" + w.Num + " " + CH[ch].Label + " <- " + val +
+                      (check ? " (再適用)" : "") + (ok ? "" : "  失敗"));
                 w.AfterWrite(ch, val, ok);
                 w.SetStatus(ok ? "ok" : "err");
             }
@@ -1590,7 +1715,7 @@ namespace Oscv
                 if (v < c.Min) v = c.Min;   // 範囲外は黙って無視されるので必ず丸める
                 if (v > c.Max) v = c.Max;
 
-                bool ok = WriteVerified(num, c, v);
+                bool ok = Ddc.WriteVerified(num, c, v);
                 Dbg.W("cli:   vcp" + c.Vcp.ToString("X2") + " <- " + v + (ok ? "" : "  失敗"));
                 any |= ok;
             }
@@ -1601,22 +1726,6 @@ namespace Oscv
         static bool Ready(int num)
         {
             return Ddc.Has(num) && Ddc.Alive(num, MainForm.ProbeCodes);
-        }
-
-        // 「書けた」と言われても板が黙って無視することがある (SetVCPFeature は
-        // 範囲外でも true を返すし、DDC 自体たまに取りこぼす)。窓を出さない分だけ
-        // 結果が目に見えないので、読み返して確かめ、違っていたら一度だけ書き直す。
-        // その板に無い項目 (LG 以外の 0xF9 など) はここで false になって次へ進む
-        static bool WriteVerified(int num, Channel c, int v)
-        {
-            for (int attempt = 0; attempt < 2; attempt++)
-            {
-                Ddc.Write(num, c.Vcp, v);
-                Thread.Sleep(40);   // DDC は続けざまの往復に弱い。少し置いてから読む
-                int raw = Ddc.Peek(num, c.Vcp);
-                if (raw >= 0 && (int)Math.Round((double)raw / c.GetDiv) == v) return true;
-            }
-            return false;
         }
 
         // 窓なし exe なので、コンソールには何も出せない。
